@@ -304,6 +304,9 @@ def get_readme_intro(
 
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
+| **Top 5 ordered** | {trial.user_attrs.get("top_5_ordered", float("nan")):.2%} | 100% *(by definition)* |
+| **Top 10 unordered** | {trial.user_attrs.get("top_10_unordered", float("nan")):.2%} | 100% *(by definition)* |
+| **Hellinger distance** | {trial.user_attrs.get("hellinger_distance", float("nan")):.4f} | 0 *(by definition)* |
 | **KL divergence** | {trial.user_attrs["kl_divergence"]:.4f} | 0 *(by definition)* |
 | **Refusals** | {trial.user_attrs["refusals"]}/{len(bad_prompts)} | {base_refusals}/{
         len(bad_prompts)

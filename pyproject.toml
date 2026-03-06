@@ -46,6 +46,11 @@ research = [
     "pacmap~=0.8",
     "scikit-learn~=1.7",
 ]
+unsloth = [
+    "trl~=0.21",
+    "unsloth",
+    "wandb~=0.21",
+]
 
 [dependency-groups]
 dev = [

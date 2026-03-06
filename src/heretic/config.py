@@ -72,6 +72,14 @@ class Settings(BaseSettings):
         ),
     )
 
+    initial_adapter_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional LoRA adapter checkpoint path to load on top of the base model "
+            "before any abliteration is applied."
+        ),
+    )
+
     dtypes: list[str] = Field(
         default=[
             # In practice, "auto" almost always means bfloat16.
@@ -135,6 +143,22 @@ class Settings(BaseSettings):
         description="Whether to print prompt/response pairs when counting refusals.",
     )
 
+    detect_reasoning_block_prefix: bool = Field(
+        default=True,
+        description=(
+            "Whether to detect reasoning blocks (e.g. <think>...</think>) at the start "
+            "of responses and skip them during evaluation using a fixed response prefix."
+        ),
+    )
+
+    detect_common_response_prefix: bool = Field(
+        default=True,
+        description=(
+            "Whether to use a literal common string prefix across sampled responses "
+            "as fallback when reasoning-block prefix detection does not find a match."
+        ),
+    )
+
     print_residual_geometry: bool = Field(
         default=False,
         description="Whether to print detailed information about residuals and refusal directions.",
@@ -181,6 +205,13 @@ class Settings(BaseSettings):
         description=(
             "Whether to adjust the refusal directions so that only the component that is "
             "orthogonal to the good direction is subtracted during abliteration."
+        ),
+    )
+
+    protect_first_layer: bool = Field(
+        default=False,
+        description=(
+            "Whether to skip abliteration on layer 0 as a safeguard against early-layer damage."
         ),
     )
 

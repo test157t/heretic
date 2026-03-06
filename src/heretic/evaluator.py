@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -15,6 +16,8 @@ class Evaluator:
     good_prompts: list[Prompt]
     bad_prompts: list[Prompt]
     base_logprobs: Tensor
+    base_top5: Tensor
+    base_top10: Tensor
     base_refusals: int
 
     def __init__(self, settings: Settings, model: Model):
@@ -30,6 +33,8 @@ class Evaluator:
 
         print("* Obtaining first-token probability distributions...")
         self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
+        self.base_top5 = self.base_logprobs.topk(5, dim=1).indices
+        self.base_top10 = self.base_logprobs.topk(10, dim=1).indices
 
         print()
         print(
@@ -92,9 +97,28 @@ class Evaluator:
 
         return refusal_count
 
-    def get_score(self) -> tuple[tuple[float, float], float, int]:
+    def get_score(self) -> tuple[tuple[float, float], float, float, float, float, int]:
         print("  * Obtaining first-token probability distributions...")
         logprobs = self.model.get_logprobs_batched(self.good_prompts)
+
+        top5 = logprobs.topk(5, dim=1).indices
+        top10 = logprobs.topk(10, dim=1).indices
+
+        top5_ordered = (top5 == self.base_top5).all(dim=1).float().mean().item()
+        top10_unordered = (
+            top10.sort(dim=1).values == self.base_top10.sort(dim=1).values
+        ).all(dim=1).float().mean().item()
+
+        print(f"  * Top 5 ordered: [bold]{top5_ordered:.2%}[/]")
+        print(f"  * Top 10 unordered: [bold]{top10_unordered:.2%}[/]")
+
+        # Mean Hellinger distance between first-token distributions.
+        # H(P, Q) = sqrt(1 - sum_i sqrt(P_i * Q_i)).
+        # We compute this in log-space for numerical stability.
+        bhattacharyya = torch.exp(0.5 * (logprobs + self.base_logprobs)).sum(dim=1)
+        hellinger_distance = torch.sqrt((1.0 - bhattacharyya).clamp(min=0.0)).mean().item()
+        print(f"  * Hellinger distance: [bold]{hellinger_distance:.4f}[/]")
+
         kl_divergence = F.kl_div(
             logprobs,
             self.base_logprobs,
@@ -122,4 +146,11 @@ class Evaluator:
             refusals_score,
         )
 
-        return score, kl_divergence, refusals
+        return (
+            score,
+            kl_divergence,
+            hellinger_distance,
+            top5_ordered,
+            top10_unordered,
+            refusals,
+        )

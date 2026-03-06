@@ -23,3 +23,7 @@ wheels/
 
 # Residual plots
 /plots/
+/venv
+/outputs
+/Qwen3.5-4B_Homebrew
+/unsloth_compiled_cache

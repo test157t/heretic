@@ -65,10 +65,49 @@ class Model:
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.model,
-            trust_remote_code=settings.trust_remote_code,
-        )
+        tokenizer_error = None
+
+        # Preferred: fast tokenizer with regex fix when supported.
+        for kwargs in [
+            {"fix_mistral_regex": True},
+            {},
+        ]:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    settings.model,
+                    trust_remote_code=settings.trust_remote_code,
+                    **kwargs,
+                )
+                break
+            except TypeError:
+                # Some Transformers versions do not support fix_mistral_regex.
+                continue
+            except ValueError as error:
+                tokenizer_error = error
+        else:
+            # Fallback: force slow tokenizer if fast tokenizer assets are missing.
+            self.tokenizer = None
+            for kwargs in [
+                {"fix_mistral_regex": True},
+                {},
+            ]:
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        settings.model,
+                        trust_remote_code=settings.trust_remote_code,
+                        use_fast=False,
+                        **kwargs,
+                    )
+                    break
+                except TypeError:
+                    continue
+                except Exception as error:
+                    tokenizer_error = error
+
+            if self.tokenizer is None:
+                raise Exception(
+                    "Failed to load tokenizer from model snapshot. Try installing tokenizer backends such as `tiktoken`/`sentencepiece`, or re-export tokenizer files."
+                ) from tokenizer_error
 
         # Fallback for tokenizers that don't declare a special pad token.
         if self.tokenizer.pad_token is None:
@@ -86,11 +125,20 @@ class Model:
             else None
         )
         self.trusted_models = {settings.model: settings.trust_remote_code}
+        self.prequantized_bnb4bit = self._is_prequantized_bnb4bit_model()
+
+        if self.prequantized_bnb4bit:
+            print("* Detected pre-quantized 4-bit checkpoint; using model-provided quantization config")
 
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
-        for dtype in settings.dtypes:
+        dtypes_to_try = settings.dtypes
+        if self.prequantized_bnb4bit:
+            # Dtype probing is not meaningful for already-quantized checkpoints.
+            dtypes_to_try = ["auto"]
+
+        for dtype in dtypes_to_try:
             print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
 
             try:
@@ -102,9 +150,11 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
+                if not self.prequantized_bnb4bit:
+                    extra_kwargs["dtype"] = dtype
+
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
-                    dtype=dtype,
                     device_map=settings.device_map,
                     max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(settings.model),
@@ -134,7 +184,7 @@ class Model:
                 print(f"[red]Failed[/] ({error})")
                 continue
 
-            if settings.quantization == QuantizationMethod.BNB_4BIT:
+            if settings.quantization == QuantizationMethod.BNB_4BIT or self.prequantized_bnb4bit:
                 print("[green]Ok[/] (quantized to 4-bit precision)")
             else:
                 print("[green]Ok[/]")
@@ -146,12 +196,33 @@ class Model:
 
         self._apply_lora()
 
+        if self.settings.initial_adapter_path:
+            print(
+                f"* Loading initial adapter from [bold]{self.settings.initial_adapter_path}[/]... ",
+                end=""
+            )
+            assert isinstance(self.model, PeftModel)
+            adapter_name = "initial"
+            self.model.load_adapter(
+                self.settings.initial_adapter_path,
+                adapter_name=adapter_name,
+                is_trainable=False,
+            )
+            self.model.set_adapter(adapter_name)
+            print("[green]Ok[/]")
+
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
         print("* Abliterable components:")
-        for component, modules in self.get_layer_modules(0).items():
+        for component in self.get_abliterable_components():
+            modules = []
+            for layer_index in range(len(self.get_layers())):
+                layer_modules = self.get_layer_modules(layer_index)
+                if component in layer_modules:
+                    modules = layer_modules[component]
+                    break
             print(
                 f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
             )
@@ -204,6 +275,9 @@ class Model:
         Returns:
             BitsAndBytesConfig or None
         """
+        if self.prequantized_bnb4bit:
+            return None
+
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
             # BitsAndBytesConfig expects a torch.dtype, not a string.
             if dtype == "auto":
@@ -218,6 +292,23 @@ class Model:
                 bnb_4bit_use_double_quant=True,
             )
         return None
+
+    def _is_prequantized_bnb4bit_model(self) -> bool:
+        config_dict, _ = PretrainedConfig.get_config_dict(self.settings.model)
+        quant_config = config_dict.get("quantization_config")
+
+        if not isinstance(quant_config, dict):
+            return False
+
+        if quant_config.get("load_in_4bit") is True:
+            return True
+
+        if quant_config.get("quant_method") == "bitsandbytes" and any(
+            [key.startswith("bnb_4bit_") for key in quant_config]
+        ):
+            return True
+
+        return False
 
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
@@ -340,9 +431,11 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Exceptions aren't suppressed here, because there is currently
-        # no alternative location for the attention out-projection.
-        try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+        # Some architectures expose attention as self_attn, others as attn.
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty:ignore[possibly-missing-attribute]
+        with suppress(Exception):
+            try_add("attn.o_proj", layer.attn.o_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Most dense models.
         with suppress(Exception):
@@ -374,7 +467,14 @@ class Model:
         return modules
 
     def get_abliterable_components(self) -> list[str]:
-        return list(self.get_layer_modules(0).keys())
+        components = []
+
+        for layer_index in range(len(self.get_layers())):
+            for component in self.get_layer_modules(layer_index):
+                if component not in components:
+                    components.append(component)
+
+        return components
 
     def abliterate(
         self,
@@ -400,7 +500,13 @@ class Model:
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
+            if self.settings.protect_first_layer and layer_index == 0:
+                continue
+
             for component, modules in self.get_layer_modules(layer_index).items():
+                if component not in parameters:
+                    continue
+
                 params = parameters[component]
 
                 # Type inference fails here for some reason.

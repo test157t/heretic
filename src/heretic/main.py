@@ -3,19 +3,26 @@
 
 import math
 import os
+import re
+import base64
+import io
+import shutil
 import sys
+import tempfile
 import time
+import tomllib
 import warnings
 from dataclasses import asdict
 from importlib.metadata import version
 from os.path import commonprefix
 from pathlib import Path
+from typing import cast
 
 import huggingface_hub
 import optuna
 import torch
 import torch.nn.functional as F
-import transformers
+from torch import Tensor
 from accelerate.utils import (
     is_mlu_available,
     is_musa_available,
@@ -35,10 +42,8 @@ from pydantic import ValidationError
 from questionary import Choice
 from rich.traceback import install
 
-from .analyzer import Analyzer
 from .config import QuantizationMethod, Settings
-from .evaluator import Evaluator
-from .model import AbliterationParameters, Model, get_model_class
+from .unsloth_stage import UnslothStageSettings, run_unsloth_stage
 from .utils import (
     empty_cache,
     format_duration,
@@ -54,6 +59,128 @@ from .utils import (
 )
 
 
+def resolve_config_file(primary: str, fallback: str | None = None) -> str:
+    if Path(primary).exists():
+        return primary
+
+    if fallback is not None and Path(fallback).exists():
+        return fallback
+
+    raise FileNotFoundError(primary)
+
+
+def load_toml_file(config_file: str) -> dict:
+    with open(config_file, "rb") as file:
+        return tomllib.load(file)
+
+
+def merge_dicts(base: dict, override: dict) -> dict:
+    merged = dict(base)
+
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+
+    return merged
+
+
+def load_settings_from_file(
+    config_file: str,
+    model_override: str | None,
+    base_config_file: str | None = None,
+) -> Settings:
+    data = load_toml_file(config_file)
+
+    if base_config_file is not None:
+        data = merge_dicts(load_toml_file(base_config_file), data)
+
+    if model_override:
+        data["model"] = model_override
+
+    return Settings.model_validate(data)
+
+
+def load_unsloth_settings_from_file(
+    config_file: str,
+    model_override: str | None,
+) -> UnslothStageSettings:
+    data = load_toml_file(config_file)
+
+    if model_override and "model" not in data:
+        data["model"] = model_override
+
+    return UnslothStageSettings.model_validate(data)
+
+
+def serialize_tensor(tensor: Tensor) -> str:
+    buffer = io.BytesIO()
+    torch.save(tensor.cpu(), buffer)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def deserialize_tensor(data: str) -> Tensor:
+    buffer = io.BytesIO(base64.b64decode(data.encode("ascii")))
+    return cast(Tensor, torch.load(buffer, map_location="cpu"))
+
+
+def find_latest_training_checkpoint(checkpoint_dir: str) -> str | None:
+    root = Path(checkpoint_dir)
+    if not root.exists():
+        return None
+
+    checkpoints = []
+    for entry in root.glob("checkpoint-*"):
+        if not entry.is_dir():
+            continue
+        try:
+            step = int(entry.name.split("-")[-1])
+        except Exception:
+            continue
+        checkpoints.append((step, entry))
+
+    if not checkpoints:
+        return None
+
+    checkpoints.sort(key=lambda item: item[0])
+    return str(checkpoints[-1][1])
+
+
+def configure_hf_token_for_session():
+    existing_token = huggingface_hub.get_token()
+
+    choices = [
+        Choice(
+            title=(
+                "Use existing Hugging Face token"
+                if existing_token
+                else "Continue without Hugging Face token"
+            ),
+            value="existing",
+        ),
+        Choice(
+            title="Enter Hugging Face token for this session",
+            value="enter",
+        ),
+    ]
+
+    print()
+    token_choice = prompt_select("Hugging Face authentication", choices)
+
+    if token_choice == "enter":
+        token = prompt_password("Hugging Face access token:")
+        if token:
+            os.environ["HF_TOKEN"] = token
+            print("* Session token set")
+        else:
+            print("* No token entered")
+    elif existing_token:
+        print("* Using existing Hugging Face token")
+    else:
+        print("* Continuing without Hugging Face token")
+
+
 def obtain_merge_strategy(settings: Settings) -> str | None:
     """
     Prompts the user for how to proceed with saving the model.
@@ -62,6 +189,8 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     """
 
     if settings.quantization == QuantizationMethod.BNB_4BIT:
+        from .model import get_model_class
+
         print()
         print(
             "Model was loaded with quantization. Merging requires reloading the base model."
@@ -128,6 +257,66 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
         return "merge"
 
 
+def prompt_runtime_quantization(default: QuantizationMethod) -> QuantizationMethod:
+    choice = prompt_select(
+        "Quantization mode",
+        [
+            Choice(
+                title=(
+                    "Use bnb_4bit"
+                    if default == QuantizationMethod.BNB_4BIT
+                    else "Use no quantization"
+                )
+                + " (recommended)",
+                value=default,
+            ),
+            Choice(
+                title=(
+                    "Use no quantization"
+                    if default == QuantizationMethod.BNB_4BIT
+                    else "Use bnb_4bit"
+                ),
+                value=(
+                    QuantizationMethod.NONE
+                    if default == QuantizationMethod.BNB_4BIT
+                    else QuantizationMethod.BNB_4BIT
+                ),
+            ),
+        ],
+    )
+
+    return choice if choice is not None else default
+
+
+def chat_with_model(model, settings: Settings):
+    print()
+    print("[cyan]Press Ctrl+C at any time to return to the menu.[/]")
+
+    chat = [
+        {"role": "system", "content": settings.system_prompt},
+    ]
+
+    while True:
+        try:
+            message = prompt_text(
+                "User:",
+                qmark=">",
+                unsafe=True,
+            )
+            if not message:
+                break
+            chat.append({"role": "user", "content": message})
+
+            print("[bold]Assistant:[/] ", end="")
+            response = model.stream_chat_response(chat)
+            chat.append(
+                {"role": "assistant", "content": response}
+            )
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C/Ctrl+D
+            break
+
+
 def run():
     # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
     if (
@@ -144,32 +333,287 @@ def run():
     )
     print()
 
-    if (
-        # There is at least one argument (argv[0] is the program name).
-        len(sys.argv) > 1
-        # No model has been explicitly provided.
-        and "--model" not in sys.argv
-        # The last argument is a parameter value rather than a flag (such as "--help").
-        and not sys.argv[-1].startswith("-")
-    ):
-        # Assume the last argument is the model.
-        sys.argv.insert(-1, "--model")
+    model_override = None
+    if len(sys.argv) > 1 and not sys.argv[-1].startswith("-"):
+        # Allow `heretic <model>` to override the model field in the selected config.
+        model_override = sys.argv[-1]
+        # Remove the positional model argument from argv so Settings-related
+        # CLI parsers in dependencies cannot treat it as an unknown flag value.
+        sys.argv = sys.argv[:-1]
+
+    configure_hf_token_for_session()
+
+    print(
+        "Select stage. Each stage uses its own config file: "
+        "[bold]config.pre.toml[/], [bold]config.ablate.toml[/], [bold]config.slop.toml[/], [bold]config.post.toml[/]."
+    )
+    print()
+    stage = prompt_select(
+        "What do you want to run?",
+        [
+            Choice(
+                title="Train with Unsloth before ablation (config.pre.toml)",
+                value="pre",
+            ),
+            Choice(
+                title="Run ablation workflow (config.ablate.toml)",
+                value="ablate",
+            ),
+            Choice(
+                title="Run slop workflow (config.slop.toml)",
+                value="slop",
+            ),
+            Choice(
+                title="Exit program",
+                value="",
+            ),
+        ],
+    )
+
+    if stage is None or stage == "":
+        return
+
+    if stage == "pre":
+        # For Unsloth pre-training, import unsloth before transformers/peft.
+        try:
+            import unsloth  # ty:ignore[unresolved-import, unused-ignore]
+        except Exception:
+            pass
+
+    # Import these lazily so pre-stage can initialize Unsloth first.
+    import transformers
+    from .analyzer import Analyzer
+    from .evaluator import Evaluator
+    from .model import AbliterationParameters, Model, get_model_class
+
+    pre_stage_settings = None
+    config_file = ""
+    base_config_file = None
 
     try:
-        # The required argument "model" must be provided by the user,
-        # either on the command line or in the configuration file.
-        settings = Settings()  # ty:ignore[missing-argument]
+        if stage == "pre":
+            pre_config_file = resolve_config_file("config.pre.toml")
+            pre_stage_settings = load_unsloth_settings_from_file(
+                pre_config_file,
+                model_override,
+            )
+            config_file = resolve_config_file("config.ablate.toml", "config.toml")
+            # If config.ablate.toml exists, use it as the sole source of truth.
+            # Only fall back to config.toml when config.ablate.toml is missing.
+            if config_file == "config.toml":
+                base_config_file = None
+
+        elif stage == "ablate":
+            config_file = resolve_config_file("config.ablate.toml", "config.toml")
+            # If config.ablate.toml exists, use it as the sole source of truth.
+            # Only fall back to config.toml when config.ablate.toml is missing.
+            if config_file == "config.toml":
+                base_config_file = None
+
+        else:
+            config_file = resolve_config_file("config.slop.toml")
+            if Path("config.ablate.toml").exists():
+                base_config_file = "config.ablate.toml"
+            elif Path("config.toml").exists():
+                base_config_file = "config.toml"
+
+        settings = load_settings_from_file(
+            config_file,
+            model_override,
+            base_config_file=base_config_file,
+        )
+    except FileNotFoundError as error:
+        missing = str(error) if str(error) else config_file
+        print(f"[red]Could not find [bold]{missing}[/].[/]")
+        return
     except ValidationError as error:
-        print(f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]")
+        print(
+            f"[red]Configuration [bold]{config_file}[/] contains [bold]{error.error_count()}[/] errors:[/]"
+        )
 
         for error in error.errors():
             print(f"[bold]{error['loc'][0]}[/]: [yellow]{error['msg']}[/]")
 
         print()
-        print(
-            "Run [bold]heretic --help[/] or see [bold]config.default.toml[/] for details about configuration parameters."
-        )
+        print("See [bold]config.default.toml[/] for details about configuration parameters.")
         return
+
+    if pre_stage_settings is not None and pre_stage_settings.enabled:
+
+        input_model = pre_stage_settings.model or settings.model
+        print()
+        resume_checkpoint = None
+        pre_checkpoint_dir = (
+            pre_stage_settings.checkpoint_output
+            or f"{pre_stage_settings.output_model}_checkpoints"
+        )
+        latest_pre_checkpoint = find_latest_training_checkpoint(pre_checkpoint_dir)
+        if latest_pre_checkpoint is not None:
+            checkpoint_action = prompt_select(
+                "Found existing pre-training checkpoints. How do you want to proceed?",
+                [
+                    "Resume from latest checkpoint",
+                    "Start a fresh training run",
+                    "Exit",
+                ],
+            )
+            if checkpoint_action == "Resume from latest checkpoint":
+                resume_checkpoint = latest_pre_checkpoint
+            elif checkpoint_action == "Exit" or checkpoint_action is None:
+                return
+
+        use_checkpoint_runtime = False
+        runtime_checkpoint = None
+
+        while True:
+            print(f"Running Unsloth pre-training using [bold]{input_model}[/]...")
+            try:
+                pre_result = run_unsloth_stage(
+                    pre_stage_settings,
+                    input_model,
+                    resume_from_checkpoint=resume_checkpoint,
+                )
+            except Exception as error:
+                print(f"[red]Pre-training failed: {error}[/]")
+                return
+
+            output_model = pre_result.output_model
+            latest_checkpoint = pre_result.latest_checkpoint
+
+            if (
+                latest_checkpoint is not None
+                and Path(output_model).name.startswith("checkpoint-")
+            ):
+                use_checkpoint_runtime = True
+                runtime_checkpoint = latest_checkpoint
+
+            if pre_result.interrupted:
+                print(
+                    f"* Pre-training interrupted. Snapshot available at [bold]{output_model}[/]."
+                )
+                action = prompt_select(
+                    "Pre-training interrupted. What now?",
+                    [
+                        "Resume training from latest checkpoint",
+                        "Continue using latest checkpoint adapter",
+                        "Chat with current snapshot",
+                        "Save current snapshot to a local folder",
+                        "Exit (I will run later)",
+                    ],
+                )
+
+                if action == "Resume training from latest checkpoint":
+                    if latest_checkpoint is None:
+                        print("[yellow]No checkpoint found to resume from.[/]")
+                        resume_checkpoint = None
+                    else:
+                        resume_checkpoint = latest_checkpoint
+                    print()
+                    continue
+                if action == "Chat with current snapshot":
+                    print()
+                    print("Loading pre-trained model for chat...")
+                    chat_settings = settings.model_copy(deep=True)
+                    if latest_checkpoint is not None:
+                        chat_settings.model = input_model
+                        chat_settings.initial_adapter_path = latest_checkpoint
+                        print(
+                            f"* Using base model [bold]{input_model}[/] with adapter checkpoint [bold]{latest_checkpoint}[/]"
+                        )
+                    else:
+                        chat_settings.model = output_model
+                    chat_settings.quantization = prompt_runtime_quantization(
+                        chat_settings.quantization
+                    )
+                    chat_model = Model(chat_settings)
+                    print()
+                    print_memory_usage()
+                    chat_with_model(chat_model, chat_settings)
+                    print()
+                    continue
+                if action == "Save current snapshot to a local folder":
+                    save_directory = prompt_path("Path to the folder:")
+                    if save_directory:
+                        if latest_checkpoint is not None:
+                            shutil.copytree(
+                                latest_checkpoint,
+                                save_directory,
+                                dirs_exist_ok=True,
+                            )
+                            print(
+                                f"Adapter checkpoint saved to [bold]{save_directory}[/]."
+                            )
+                        else:
+                            shutil.copytree(output_model, save_directory, dirs_exist_ok=True)
+                            print(f"Model saved to [bold]{save_directory}[/].")
+                    print()
+                    continue
+                if action is None or action == "Exit (I will run later)":
+                    return
+                if action == "Continue using latest checkpoint adapter":
+                    if latest_checkpoint is None:
+                        print(
+                            "[yellow]No checkpoint found. Continuing with snapshot directory instead.[/]"
+                        )
+                    else:
+                        use_checkpoint_runtime = True
+                        runtime_checkpoint = latest_checkpoint
+            else:
+                print(f"* Pre-training completed. Output saved to [bold]{output_model}[/].")
+            break
+
+        while True:
+            pre_action = prompt_select(
+                "What do you want to do next?",
+                [
+                    "Continue to ablation with the pre-trained model",
+                    "Save pre-trained model to a local folder",
+                    "Chat with pre-trained model",
+                    "Exit (I will run ablation later)",
+                ],
+            )
+            if pre_action == "Continue to ablation with the pre-trained model":
+                break
+            if pre_action is None or pre_action == "Exit (I will run ablation later)":
+                return
+
+            if pre_action == "Save pre-trained model to a local folder":
+                save_directory = prompt_path("Path to the folder:")
+                if not save_directory:
+                    continue
+
+                shutil.copytree(output_model, save_directory, dirs_exist_ok=True)
+                print(f"Model saved to [bold]{save_directory}[/].")
+                continue
+
+            print()
+            print(f"Loading pre-trained model [bold]{output_model}[/] for chat...")
+            chat_settings = settings.model_copy(deep=True)
+            if use_checkpoint_runtime and runtime_checkpoint is not None:
+                chat_settings.model = input_model
+                chat_settings.initial_adapter_path = runtime_checkpoint
+            else:
+                chat_settings.model = output_model
+            if "float32" in chat_settings.dtypes and chat_settings.dtypes[0] != "float32":
+                chat_settings.dtypes = ["float32"] + [
+                    dtype for dtype in chat_settings.dtypes if dtype != "float32"
+                ]
+
+            chat_model = Model(chat_settings)
+            print()
+            print_memory_usage()
+            chat_with_model(chat_model, chat_settings)
+
+        if use_checkpoint_runtime and runtime_checkpoint is not None:
+            settings.model = input_model
+            settings.initial_adapter_path = runtime_checkpoint
+            print(
+                f"* Continuing with base model [bold]{input_model}[/] + adapter checkpoint [bold]{runtime_checkpoint}[/]"
+            )
+        else:
+            settings.model = output_model
+            settings.initial_adapter_path = None
+        settings.quantization = prompt_runtime_quantization(settings.quantization)
 
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
@@ -259,14 +703,14 @@ def run():
             print(
                 (
                     "[green]You have already processed this model.[/] "
-                    "You can show the results from the previous run, allowing you to export models or to run additional trials. "
+                    "You can load the previous run (this reloads the model and recomputes refusal directions) to export/chat or run additional trials. "
                     "Alternatively, you can ignore the previous run and start from scratch. "
                     "This will delete the checkpoint file and all results from the previous run."
                 )
             )
             choices.append(
                 Choice(
-                    title="Show the results from the previous run",
+                    title="Load previous run results",
                     value="continue",
                 )
             )
@@ -308,12 +752,29 @@ def run():
             settings = Settings.model_validate_json(
                 existing_study.user_attrs["settings"]
             )
+            print("* Loading previous run state...")
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
             storage = JournalStorage(backend)
         elif choice is None or choice == "":
             return
+
+    study = optuna.create_study(
+        sampler=TPESampler(
+            n_startup_trials=settings.n_startup_trials,
+            n_ei_candidates=128,
+            multivariate=True,
+        ),
+        directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+        storage=storage,
+        study_name="heretic",
+        load_if_exists=True,
+    )
+
+    study.set_user_attr("settings", settings.model_dump_json())
+    if "finished" not in study.user_attrs:
+        study.set_user_attr("finished", False)
 
     model = Model(settings)
     print()
@@ -376,53 +837,122 @@ def run():
         print(f"* Chosen batch size: [bold]{settings.batch_size}[/]")
 
     print()
-    print("Checking for common response prefix...")
-    prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
-    responses = model.get_responses_batched(prefix_check_prompts)
+    print("Checking response prefix...")
 
-    # Despite being located in os.path, commonprefix actually performs
-    # a naive string operation without any path-specific logic,
-    # which is exactly what we need here. Trailing spaces are removed
-    # to avoid issues where multiple different tokens that all start
-    # with a space character lead to the common prefix ending with
-    # a space, which would result in an uncommon tokenization.
-    model.response_prefix = commonprefix(responses).rstrip(" ")
+    prefix_detection_enabled = (
+        settings.detect_reasoning_block_prefix
+        or settings.detect_common_response_prefix
+    )
 
-    # Suppress CoT output.
-    recheck_prefix = False
-    if model.response_prefix:
-        # When using any of the predefined prefixes below, we need to check that
-        # the prefix is actually complete (e.g. not missing a trailing newline).
-        recheck_prefix = True
-        if model.response_prefix.startswith("<think>"):
-            # Most thinking models.
-            model.response_prefix = "<think></think>"
-        elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
-            # gpt-oss.
-            model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
-        elif model.response_prefix.startswith("<thought>"):
-            # Unknown, suggested by user.
-            model.response_prefix = "<thought></thought>"
-        elif model.response_prefix.startswith("[THINK]"):
-            # Unknown, suggested by user.
-            model.response_prefix = "[THINK][/THINK]"
-        else:
-            recheck_prefix = False
-
-    if model.response_prefix:
-        print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+    if not prefix_detection_enabled:
+        model.response_prefix = ""
+        print("* Response prefix detection disabled")
     else:
-        print("* None found")
-
-    if recheck_prefix:
-        print("* Rechecking with prefix...")
+        prefix_check_prompts = good_prompts[:100] + bad_prompts[:100]
         responses = model.get_responses_batched(prefix_check_prompts)
-        additional_prefix = commonprefix(responses).rstrip(" ")
-        if additional_prefix:
-            model.response_prefix += additional_prefix
-            print(f"* Extended prefix found: [bold]{model.response_prefix!r}[/]")
 
-    evaluator = Evaluator(settings, model)
+    def canonicalize_reasoning_prefix(prefix: str) -> str | None:
+        def strip_control_prefix(text: str) -> str:
+            # Drop leading control tokens and whitespace (e.g. <|...|>, <s>, [INST])
+            # so we can robustly detect reasoning wrappers that start a little later.
+            # Intentionally do not remove generic <...> / [...] tags, because that
+            # would also strip reasoning wrappers like <think> or [THINK].
+            while True:
+                updated = re.sub(
+                    r"^(?:\s+|<\|[^|]+\|>|</?s>|\[/?INST\]|\[/?SYSTEM\]|\[/?USER\]|\[/?ASSISTANT\])",
+                    "",
+                    text,
+                )
+                if updated == text:
+                    return text
+                text = updated
+
+        normalized = strip_control_prefix(prefix)
+        normalized_lower = normalized.lower()
+
+        if normalized_lower.startswith("<think>"):
+            # Most thinking models.
+            return "<think></think>"
+        if normalized.startswith("<|channel|>analysis<|message|>"):
+            # gpt-oss.
+            return "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+        if normalized_lower.startswith("<thought>"):
+            # Unknown, suggested by user.
+            return "<thought></thought>"
+        if normalized_lower.startswith("[think]"):
+            # Unknown, suggested by user.
+            return "[THINK][/THINK]"
+
+        return None
+
+    def detect_reasoning_prefix(responses: list[str]) -> tuple[str, int]:
+        prefix_counts: dict[str, int] = {}
+
+        for response in responses:
+            response = response.lstrip()
+            prefix = canonicalize_reasoning_prefix(response)
+            if prefix is None:
+                continue
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+
+        if not prefix_counts:
+            return "", 0
+
+        return max(prefix_counts.items(), key=lambda item: item[1])
+
+    if prefix_detection_enabled:
+        recheck_prefix = False
+        model.response_prefix = ""
+
+        if settings.detect_reasoning_block_prefix:
+            detected_prefix, detected_count = detect_reasoning_prefix(responses)
+            if detected_prefix:
+                model.response_prefix = detected_prefix
+                recheck_prefix = True
+                print(
+                    f"* Reasoning block detected in [bold]{detected_count}[/]/{len(prefix_check_prompts)} responses"
+                )
+            else:
+                print("* No reasoning block prefix detected")
+
+        if not model.response_prefix and settings.detect_common_response_prefix:
+            # Despite being located in os.path, commonprefix actually performs
+            # a naive string operation without any path-specific logic,
+            # which is exactly what we need here. Trailing spaces are removed
+            # to avoid issues where multiple different tokens that all start
+            # with a space character lead to the common prefix ending with
+            # a space, which would result in an uncommon tokenization.
+            model.response_prefix = commonprefix(responses).rstrip(" ")
+
+            canonical_prefix = canonicalize_reasoning_prefix(model.response_prefix)
+            if canonical_prefix is not None:
+                # When using predefined prefixes, we need to check that the
+                # prefix is actually complete (e.g. not missing trailing newlines).
+                model.response_prefix = canonical_prefix
+                recheck_prefix = True
+        elif not model.response_prefix:
+            print("* Common prefix fallback disabled")
+
+        if model.response_prefix:
+            print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+        else:
+            print("* None found")
+
+        if recheck_prefix:
+            print("* Rechecking with prefix...")
+            responses = model.get_responses_batched(prefix_check_prompts)
+            additional_prefix = commonprefix(responses).rstrip(" ")
+            if additional_prefix:
+                model.response_prefix += additional_prefix
+                print(f"* Extended prefix found: [bold]{model.response_prefix!r}[/]")
+
+    evaluator = None
+
+    def get_evaluator() -> Evaluator:
+        nonlocal evaluator
+        if evaluator is None:
+            evaluator = Evaluator(settings, model)
+        return evaluator
 
     if settings.evaluate_model is not None:
         print()
@@ -430,43 +960,62 @@ def run():
         settings.model = settings.evaluate_model
         model.reset_model()
         print("* Evaluating...")
-        evaluator.get_score()
+        get_evaluator().get_score()
         return
 
     print()
-    print("Calculating per-layer refusal directions...")
-    print("* Obtaining residuals for good prompts...")
-    good_residuals = model.get_residuals_batched(good_prompts)
-    print("* Obtaining residuals for bad prompts...")
-    bad_residuals = model.get_residuals_batched(bad_prompts)
+    print("Preparing refusal directions...")
+    refusal_directions = None
+    serialized_refusal_directions = study.user_attrs.get("refusal_directions")
+    if isinstance(serialized_refusal_directions, str):
+        try:
+            refusal_directions = deserialize_tensor(serialized_refusal_directions)
+            print("* Loaded saved refusal directions from previous run")
+        except Exception:
+            refusal_directions = None
 
-    good_means = good_residuals.mean(dim=0)
-    bad_means = bad_residuals.mean(dim=0)
+    def get_refusal_directions() -> Tensor:
+        nonlocal refusal_directions
 
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+        if refusal_directions is not None:
+            return refusal_directions
 
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+        print("* Calculating per-layer refusal directions...")
+        print("* Obtaining residuals for good prompts...")
+        good_residuals = model.get_residuals_batched(good_prompts)
+        print("* Obtaining residuals for bad prompts...")
+        bad_residuals = model.get_residuals_batched(bad_prompts)
 
-    analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+        good_means = good_residuals.mean(dim=0)
+        bad_means = bad_residuals.mean(dim=0)
 
-    if settings.print_residual_geometry:
-        analyzer.print_residual_geometry()
+        refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
 
-    if settings.plot_residuals:
-        analyzer.plot_residuals()
+        if settings.orthogonalize_direction:
+            # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+            # Adjust the refusal directions so that only the component that is
+            # orthogonal to the good direction is subtracted during abliteration.
+            good_directions = F.normalize(good_means, p=2, dim=1)
+            projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+            refusal_directions = (
+                refusal_directions - projection_vector.unsqueeze(1) * good_directions
+            )
+            refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
 
-    # We don't need the residuals after computing refusal directions.
-    del good_residuals, bad_residuals, analyzer
-    empty_cache()
+        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+
+        if settings.print_residual_geometry:
+            analyzer.print_residual_geometry()
+
+        if settings.plot_residuals:
+            analyzer.plot_residuals()
+
+        # We don't need the residuals after computing refusal directions.
+        del good_residuals, bad_residuals, analyzer
+        empty_cache()
+
+        study.set_user_attr("refusal_directions", serialize_tensor(refusal_directions))
+        return refusal_directions
 
     trial_index = 0
     start_index = 0
@@ -553,9 +1102,16 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(get_refusal_directions(), direction_index, parameters)
         print("* Evaluating...")
-        score, kl_divergence, refusals = evaluator.get_score()
+        (
+            score,
+            kl_divergence,
+            hellinger_distance,
+            top5_ordered,
+            top10_unordered,
+            refusals,
+        ) = get_evaluator().get_score()
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (
@@ -570,6 +1126,9 @@ def run():
         print_memory_usage()
 
         trial.set_user_attr("kl_divergence", kl_divergence)
+        trial.set_user_attr("hellinger_distance", hellinger_distance)
+        trial.set_user_attr("top_5_ordered", top5_ordered)
+        trial.set_user_attr("top_10_unordered", top10_unordered)
         trial.set_user_attr("refusals", refusals)
 
         return score
@@ -581,21 +1140,6 @@ def run():
             # Stop the study gracefully on Ctrl+C.
             trial.study.stop()
             raise TrialPruned()
-
-    study = optuna.create_study(
-        sampler=TPESampler(
-            n_startup_trials=settings.n_startup_trials,
-            n_ei_candidates=128,
-            multivariate=True,
-        ),
-        directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
-        storage=storage,
-        study_name="heretic",
-        load_if_exists=True,
-    )
-
-    study.set_user_attr("settings", settings.model_dump_json())
-    study.set_user_attr("finished", False)
 
     def count_completed_trials() -> int:
         # Count number of complete trials to compute trials to run.
@@ -646,12 +1190,20 @@ def run():
                 min_divergence = kl_divergence
                 best_trials.append(trial)
 
+        bad_eval_count = cast(int, study.user_attrs.get("bad_evaluation_prompt_count", 0))
+        if bad_eval_count <= 0:
+            bad_eval_count = len(load_prompts(settings, settings.bad_evaluation_prompts))
+            study.set_user_attr("bad_evaluation_prompt_count", bad_eval_count)
+
         choices = [
             Choice(
                 title=(
                     f"[Trial {trial.user_attrs['index']:>3}] "
-                    f"Refusals: {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-                    f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}"
+                    f"Refusals: {trial.user_attrs['refusals']:>2}/{bad_eval_count}, "
+                    f"KL divergence: {trial.user_attrs['kl_divergence']:.4f}, "
+                    f"Hellinger distance: {trial.user_attrs.get('hellinger_distance', float('nan')):.4f}, "
+                    f"Top 5 ordered: {trial.user_attrs.get('top_5_ordered', float('nan')):.1%}, "
+                    f"Top 10 unordered: {trial.user_attrs.get('top_10_unordered', float('nan')):.1%}"
                 ),
                 value=trial,
             )
@@ -736,7 +1288,7 @@ def run():
             model.reset_model()
             print("* Abliterating...")
             model.abliterate(
-                refusal_directions,
+                get_refusal_directions(),
                 trial.user_attrs["direction_index"],
                 {
                     k: AbliterationParameters(**v)
@@ -749,6 +1301,7 @@ def run():
                 action = prompt_select(
                     "What do you want to do with the decensored model?",
                     [
+                        "Train with Unsloth (config.post.toml)",
                         "Save the model to a local folder",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
@@ -764,6 +1317,134 @@ def run():
                 # the optimized model.
                 try:
                     match action:
+                        case "Train with Unsloth (config.post.toml)":
+                            post_config = resolve_config_file("config.post.toml")
+                            post_stage_settings = load_unsloth_settings_from_file(
+                                post_config,
+                                None,
+                            )
+                            if not post_stage_settings.enabled:
+                                print("Post-training stage is disabled in config.post.toml.")
+                                continue
+
+                            output_model_override = prompt_text(
+                                "Output path for post-training model:",
+                                default=post_stage_settings.output_model,
+                            )
+                            if output_model_override:
+                                post_stage_settings.output_model = output_model_override
+
+                            strategy = obtain_merge_strategy(settings)
+                            if strategy is None:
+                                continue
+
+                            temp_model_dir = tempfile.mkdtemp(prefix="heretic-post-")
+                            try:
+                                print("Preparing selected trial model for post-training...")
+                                merged_model = model.get_merged_model()
+                                merged_model.save_pretrained(temp_model_dir)
+                                model.tokenizer.save_pretrained(temp_model_dir)
+                                del merged_model
+                                empty_cache()
+
+                                print(
+                                    f"Running Unsloth post-training using [bold]{temp_model_dir}[/]..."
+                                )
+                                output_model = ""
+                                resume_checkpoint = None
+                                post_checkpoint_dir = (
+                                    post_stage_settings.checkpoint_output
+                                    or f"{post_stage_settings.output_model}_checkpoints"
+                                )
+                                latest_post_checkpoint = find_latest_training_checkpoint(
+                                    post_checkpoint_dir
+                                )
+                                if latest_post_checkpoint is not None:
+                                    checkpoint_action = prompt_select(
+                                        "Found existing post-training checkpoints. How do you want to proceed?",
+                                        [
+                                            "Resume from latest checkpoint",
+                                            "Start a fresh training run",
+                                            "Cancel post-training",
+                                        ],
+                                    )
+                                    if checkpoint_action == "Resume from latest checkpoint":
+                                        resume_checkpoint = latest_post_checkpoint
+                                    elif (
+                                        checkpoint_action == "Cancel post-training"
+                                        or checkpoint_action is None
+                                    ):
+                                        output_model = None
+
+                                while True:
+                                    if output_model is None:
+                                        break
+
+                                    post_result = run_unsloth_stage(
+                                        post_stage_settings,
+                                        temp_model_dir,
+                                        resume_from_checkpoint=resume_checkpoint,
+                                    )
+                                    output_model = post_result.output_model
+                                    latest_checkpoint = post_result.latest_checkpoint
+
+                                    if not post_result.interrupted:
+                                        break
+
+                                    print(
+                                        f"* Post-training interrupted. Snapshot available at [bold]{output_model}[/]."
+                                    )
+                                    post_action = prompt_select(
+                                        "Post-training interrupted. What now?",
+                                        [
+                                            "Resume training from latest checkpoint",
+                                            "Reload current snapshot",
+                                            "Keep current in-memory model and return",
+                                        ],
+                                    )
+
+                                    if post_action == "Resume training from latest checkpoint":
+                                        if latest_checkpoint is None:
+                                            print("[yellow]No checkpoint found to resume from.[/]")
+                                            resume_checkpoint = None
+                                        else:
+                                            resume_checkpoint = latest_checkpoint
+                                        continue
+
+                                    if (
+                                        post_action is None
+                                        or post_action
+                                        == "Keep current in-memory model and return"
+                                    ):
+                                        output_model = None
+                                        break
+
+                                    # Reload current snapshot now.
+                                    break
+
+                                if output_model is None:
+                                    continue
+                            finally:
+                                shutil.rmtree(temp_model_dir, ignore_errors=True)
+
+                            print(
+                                f"* Post-training completed. Output saved to [bold]{output_model}[/]."
+                            )
+
+                            if post_stage_settings.merge_after:
+                                print("Reloading post-trained model...")
+                                settings.model = output_model
+                                settings.quantization = prompt_runtime_quantization(
+                                    settings.quantization
+                                )
+                                model = Model(settings)
+                                print()
+                                print_memory_usage()
+                            else:
+                                print(
+                                    "* Post-training produced an adapter-only output; keeping the current in-memory model for chat/save/upload."
+                                )
+
                         case "Save the model to a local folder":
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
@@ -862,6 +1543,7 @@ def run():
                             else:
                                 card = ModelCard.load(settings.model)
                             if card is not None:
+                                evaluator_for_card = get_evaluator()
                                 if card.data is None:
                                     card.data = ModelCardData()
                                 if card.data.tags is None:
@@ -874,8 +1556,8 @@ def run():
                                     get_readme_intro(
                                         settings,
                                         trial,
-                                        evaluator.base_refusals,
-                                        evaluator.bad_prompts,
+                                        evaluator_for_card.base_refusals,
+                                        evaluator_for_card.bad_prompts,
                                     )
                                     + card.text
                                 )
@@ -884,34 +1566,7 @@ def run():
                             print(f"Model uploaded to [bold]{repo_id}[/].")
 
                         case "Chat with the model":
-                            print()
-                            print(
-                                "[cyan]Press Ctrl+C at any time to return to the menu.[/]"
-                            )
-
-                            chat = [
-                                {"role": "system", "content": settings.system_prompt},
-                            ]
-
-                            while True:
-                                try:
-                                    message = prompt_text(
-                                        "User:",
-                                        qmark=">",
-                                        unsafe=True,
-                                    )
-                                    if not message:
-                                        break
-                                    chat.append({"role": "user", "content": message})
-
-                                    print("[bold]Assistant:[/] ", end="")
-                                    response = model.stream_chat_response(chat)
-                                    chat.append(
-                                        {"role": "assistant", "content": response}
-                                    )
-                                except (KeyboardInterrupt, EOFError):
-                                    # Ctrl+C/Ctrl+D
-                                    break
+                            chat_with_model(model, settings)
 
                 except Exception as error:
                     print(f"[red]Error: {error}[/]")

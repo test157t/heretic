@@ -1,0 +1,80 @@
+# Unsloth pre-ablation training stage configuration.
+# This file is consumed when selecting the pre-training menu action.
+# Heretic currently validates this file exists and is parseable TOML.
+
+enabled = true
+
+# Model to train before ablation.
+model = "Qwen3.5-4B_Abliterated"
+
+# Training dataset for Unsloth.
+dataset = "Nitral-AI/Instruct_2.6.7_2048"
+# Or provide multiple datasets and disable/ignore `dataset` if preferred.
+# datasets = ["Nitral-AI/Instruct_2.6.7_2048", "another/dataset"]
+dataset_split = "train"
+text_column = "text"
+
+# Randomization / sampling controls.
+shuffle_dataset = true
+seed = 42
+sample_size = 512
+
+# Dataset formatting mode: "text" or "chatml".
+dataset_format = "chatml"
+messages_column = "conversations"
+use_tokenizer_chat_template = false
+use_unsloth_chat_template = true
+chat_template_name = "chatml"
+chat_template_map_eos_token = false
+# Strip leading <think>/<thought> wrappers right after assistant role boundaries.
+strip_assistant_reasoning_blocks = true
+role_key = "from"
+content_key = "value"
+user_roles = ["human", "user"]
+assistant_roles = ["gpt", "assistant", "model"]
+system_roles = ["system"]
+
+# Typical Unsloth knobs (template only).
+load_in_4bit = false
+bf16 = true
+fp16 = false
+# The dataset targets 2048 context; use extra room for template/control tokens.
+max_seq_length = 2512
+batch_size = 1
+gradient_accumulation_steps = 4
+learning_rate = 7e-5
+epochs = 2
+# Set to -1 to train by epochs. Any positive value overrides epochs.
+max_steps = -1
+max_grad_norm = 2.0
+# Use either warmup_steps or warmup_ratio. If warmup_ratio is set,
+# it takes precedence and warmup_steps is ignored.
+# warmup_steps = 5
+warmup_ratio = 0.07
+lr_scheduler_type = "cosine"
+logging_steps = 10
+save_steps = 10
+
+# LoRA template knobs.
+lora_r = 32
+lora_alpha = 32
+lora_dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+# Mask non-assistant tokens during loss computation.
+train_on_responses_only = true
+
+# Optional explicit delimiters for response-only masking.
+instruction_part = "<|im_start|>user\n"
+response_part = "<|im_start|>assistant\n"
+
+# If response_part accidentally includes reasoning tags, strip them.
+strip_reasoning_tag_in_mask = true
+
+# Weights & Biases logging.
+wandb_enabled = false
+# wandb_project = "heretic-pre"
+# wandb_entity = "your-team"
+# wandb_run_name = "qwen35-pre"
+# wandb_tags = ["pre", "unsloth", "qwen3.5-4b"]

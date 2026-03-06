@@ -19,7 +19,7 @@ dtypes = [
 # Quantization method to use when loading the model. Options:
 # "none" (no quantization),
 # "bnb_4bit" (4-bit quantization using bitsandbytes).
-quantization = "none"
+quantization = "bnb_4bit"
 
 # Device map to pass to Accelerate when loading the model.
 device_map = "auto"
@@ -28,7 +28,7 @@ device_map = "auto"
 # max_memory = {"0": "20GB", "cpu": "64GB"}
 
 # Number of input sequences to process in parallel (0 = auto).
-batch_size = 0  # auto
+batch_size = 16  # auto
 
 # Maximum batch size to try when automatically determining the optimal batch size.
 max_batch_size = 128
@@ -41,11 +41,11 @@ print_responses = false
 
 # Whether to detect reasoning blocks (e.g. <think>...</think>) at the start
 # of responses and skip them during evaluation using a fixed response prefix.
-detect_reasoning_block_prefix = true
+detect_reasoning_block_prefix = false
 
 # Whether to use a literal common string prefix across sampled responses
 # as fallback when reasoning-block prefix detection does not find a match.
-detect_common_response_prefix = true
+detect_common_response_prefix = false
 
 # Whether to print detailed information about residuals and refusal directions.
 print_residual_geometry = false
@@ -72,7 +72,7 @@ kl_divergence_target = 0.01
 
 # Whether to adjust the refusal directions so that only the component that is
 # orthogonal to the good direction is subtracted during abliteration.
-orthogonalize_direction = false
+orthogonalize_direction = true
 
 # Whether to skip abliteration on layer 0 as a safeguard.
 protect_first_layer = false
@@ -81,7 +81,7 @@ protect_first_layer = false
 # "none" (no normalization),
 # "pre" (compute LoRA adapter relative to row-normalized weights),
 # "full" (like "pre", but renormalizes to preserve original row magnitudes).
-row_normalization = "none"
+row_normalization = "full"
 
 # The rank of the LoRA adapter to use when "full" row normalization is used.
 # Row magnitude preservation is approximate due to non-linear effects,
