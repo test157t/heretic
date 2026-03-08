@@ -43,7 +43,13 @@ from questionary import Choice
 from rich.traceback import install
 
 from .config import QuantizationMethod, Settings
-from .unsloth_stage import UnslothStageSettings, run_unsloth_stage
+from .unsloth_stage import (
+    UnslothStageSettings,
+    export_unsloth_checkpoint_snapshot,
+    export_unsloth_checkpoint_snapshot_dual,
+    quantize_snapshot_to_4bit,
+    run_unsloth_stage,
+)
 from .utils import (
     empty_cache,
     format_duration,
@@ -288,6 +294,32 @@ def prompt_runtime_quantization(default: QuantizationMethod) -> QuantizationMeth
     return choice if choice is not None else default
 
 
+def suggest_full_precision_base(model_name: str) -> str:
+    lowered = model_name.lower()
+    suffixes = ["-bnb-4bit", "-4bit", "-int4", "-awq"]
+    for suffix in suffixes:
+        if lowered.endswith(suffix):
+            return model_name[: -len(suffix)]
+    return model_name
+
+
+def suggest_4bit_export_path(path_16bit: str) -> str:
+    lowered = path_16bit.lower()
+
+    replacements = [
+        ("-bf16", "-bnb-4bit"),
+        ("_bf16", "_bnb-4bit"),
+        ("-16bit", "-bnb-4bit"),
+        ("_16bit", "_bnb-4bit"),
+    ]
+
+    for suffix, replacement in replacements:
+        if lowered.endswith(suffix):
+            return path_16bit[: -len(suffix)] + replacement
+
+    return f"{path_16bit}-bnb-4bit"
+
+
 def chat_with_model(model, settings: Settings):
     print()
     print("[cyan]Press Ctrl+C at any time to return to the menu.[/]")
@@ -318,12 +350,19 @@ def chat_with_model(model, settings: Settings):
 
 
 def run():
-    # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
+    # Configure CUDA allocator defaults to reduce fragmentation-induced OOM.
     if (
         "PYTORCH_ALLOC_CONF" not in os.environ
         and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
     ):
-        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+        if os.name == "nt":
+            # Windows CUDA builds may not support expandable_segments reliably.
+            allocator_conf = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+        else:
+            allocator_conf = "expandable_segments:True,max_split_size_mb:128"
+
+        os.environ["PYTORCH_ALLOC_CONF"] = allocator_conf
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = allocator_conf
 
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
     print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
@@ -344,15 +383,15 @@ def run():
     configure_hf_token_for_session()
 
     print(
-        "Select stage. Each stage uses its own config file: "
-        "[bold]config.pre.toml[/], [bold]config.ablate.toml[/], [bold]config.slop.toml[/], [bold]config.post.toml[/]."
+        "Select workflow. Training/ablation/slop use config files: "
+        "[bold]config.train.toml[/], [bold]config.ablate.toml[/], [bold]config.slop.toml[/]."
     )
     print()
     stage = prompt_select(
         "What do you want to run?",
         [
             Choice(
-                title="Train with Unsloth before ablation (config.pre.toml)",
+                title="Train with Unsloth (config.train.toml)",
                 value="pre",
             ),
             Choice(
@@ -364,6 +403,10 @@ def run():
                 value="slop",
             ),
             Choice(
+                title="Quantize model to bnb_4bit",
+                value="quantize",
+            ),
+            Choice(
                 title="Exit program",
                 value="",
             ),
@@ -373,8 +416,30 @@ def run():
     if stage is None or stage == "":
         return
 
+    if stage == "quantize":
+        print()
+        model_name = prompt_text("Model path or Hugging Face ID to quantize:")
+        if not model_name:
+            return
+
+        output_default = suggest_4bit_export_path(model_name)
+        output_model = prompt_text(
+            "Output folder for bnb_4bit model:",
+            default=output_default,
+        )
+        if not output_model:
+            return
+
+        try:
+            print(f"Quantizing [bold]{model_name}[/] to bnb_4bit...")
+            quantize_snapshot_to_4bit(model_name=model_name, output_model=output_model)
+            print(f"Quantized model saved to [bold]{output_model}[/].")
+        except Exception as error:
+            print(f"[red]Quantization failed: {error}[/]")
+        return
+
     if stage == "pre":
-        # For Unsloth pre-training, import unsloth before transformers/peft.
+        # For Unsloth training, import unsloth before transformers/peft.
         try:
             import unsloth  # ty:ignore[unresolved-import, unused-ignore]
         except Exception:
@@ -392,7 +457,7 @@ def run():
 
     try:
         if stage == "pre":
-            pre_config_file = resolve_config_file("config.pre.toml")
+            pre_config_file = resolve_config_file("config.train.toml")
             pre_stage_settings = load_unsloth_settings_from_file(
                 pre_config_file,
                 model_override,
@@ -450,7 +515,7 @@ def run():
         latest_pre_checkpoint = find_latest_training_checkpoint(pre_checkpoint_dir)
         if latest_pre_checkpoint is not None:
             checkpoint_action = prompt_select(
-                "Found existing pre-training checkpoints. How do you want to proceed?",
+                "Found existing training checkpoints. How do you want to proceed?",
                 [
                     "Resume from latest checkpoint",
                     "Start a fresh training run",
@@ -465,16 +530,144 @@ def run():
         use_checkpoint_runtime = False
         runtime_checkpoint = None
 
+        def print_export_verification(report):
+            if not isinstance(report, dict):
+                return
+
+            lora_signal = report.get("lora_signal")
+            merge_deltas = report.get("merge_deltas")
+            if not isinstance(lora_signal, dict) or not isinstance(merge_deltas, dict):
+                return
+
+            lora_b_nonzero = int(lora_signal.get("lora_b_nonzero_tensors", 0))
+            lora_b_total = int(lora_signal.get("lora_b_tensors", 0))
+            lora_b_abs_sum = float(lora_signal.get("lora_b_abs_sum", 0.0))
+            changed_count = int(merge_deltas.get("changed_count", 0))
+            compared_count = int(merge_deltas.get("compared_count", 0))
+            max_delta = float(merge_deltas.get("max_mean_abs_delta", 0.0))
+
+            print("* Merge verification")
+            print(
+                f"  * LoRA B tensors with signal: [bold]{lora_b_nonzero}[/]/[bold]{lora_b_total}[/] (abs_sum={lora_b_abs_sum:.4e})"
+            )
+            print(
+                f"  * Sampled merged weights changed: [bold]{changed_count}[/]/[bold]{compared_count}[/] (max mean abs delta={max_delta:.4e})"
+            )
+
+            if lora_b_nonzero == 0 or lora_b_abs_sum <= 0.0:
+                print(
+                    "[yellow]  * Warning: adapter appears near-zero; training may not have updated LoRA weights.[/]"
+                )
+            elif changed_count == 0:
+                print(
+                    "[yellow]  * Warning: sampled merged weights did not change; verify checkpoint/base pairing.[/]"
+                )
+            else:
+                print("[green]  * Adapter signal and merge deltas look non-zero.[/]")
+
+        def save_pretrained_output(save_directory: str):
+            if use_checkpoint_runtime and runtime_checkpoint is not None:
+                save_mode = prompt_select(
+                    "How do you want to save the pre-trained output?",
+                    [
+                        "Merged full model (16-bit)",
+                        "Merged full model (4-bit)",
+                        "Merged full models (16-bit + 4-bit)",
+                        "Adapter checkpoint only",
+                    ],
+                )
+
+                suggested_base = suggest_full_precision_base(input_model)
+
+                if save_mode == "Adapter checkpoint only":
+                    shutil.copytree(
+                        runtime_checkpoint,
+                        save_directory,
+                        dirs_exist_ok=True,
+                    )
+                    print(f"Adapter checkpoint saved to [bold]{save_directory}[/].")
+                    return
+
+                if save_mode == "Merged full models (16-bit + 4-bit)":
+                    merge_base_model = prompt_text(
+                        "Full-precision base model/path for merged exports (required for pre-quantized bases):",
+                        default=suggested_base,
+                    )
+                    if merge_base_model is not None:
+                        merge_base_model = merge_base_model.strip()
+                    if not merge_base_model:
+                        print("[yellow]Combined export cancelled.[/]")
+                        return
+
+                    save_directory_4 = suggest_4bit_export_path(save_directory)
+                    print(
+                        f"Exporting merged 16-bit and 4-bit models from checkpoint [bold]{runtime_checkpoint}[/]..."
+                    )
+                    print(f"* 16-bit output: [bold]{save_directory}[/]")
+                    print(f"* 4-bit output: [bold]{save_directory_4}[/]")
+                    verification = export_unsloth_checkpoint_snapshot_dual(
+                        base_model=input_model,
+                        adapter_checkpoint=runtime_checkpoint,
+                        output_model_16bit=save_directory,
+                        output_model_4bit=save_directory_4,
+                        merge_base_model=merge_base_model,
+                    )
+                    print(
+                        f"Merged models saved to [bold]{save_directory}[/] and [bold]{save_directory_4}[/]."
+                    )
+                    print_export_verification(verification)
+                    return
+
+                save_method = (
+                    "merged_16bit"
+                    if save_mode == "Merged full model (16-bit)"
+                    else "merged_4bit"
+                )
+                merge_base_model = None
+                if save_method == "merged_16bit":
+                    merge_base_model = prompt_text(
+                        "Full-precision base model/path for 16-bit merge (required for pre-quantized bases):",
+                        default=suggested_base,
+                    )
+                    if not merge_base_model:
+                        print("[yellow]16-bit merge cancelled.[/]")
+                        return
+                else:
+                    merge_base_model = prompt_text(
+                        "Optional full-precision base model/path for 4-bit export (recommended for pre-quantized bases):",
+                        default=suggested_base,
+                    )
+                    if merge_base_model == "":
+                        merge_base_model = None
+
+                print(
+                    f"Exporting merged model from checkpoint [bold]{runtime_checkpoint}[/]..."
+                )
+                verification = export_unsloth_checkpoint_snapshot(
+                    base_model=input_model,
+                    adapter_checkpoint=runtime_checkpoint,
+                    output_model=save_directory,
+                    save_method=save_method,
+                    merge_base_model=merge_base_model,
+                )
+                print(f"Merged model saved to [bold]{save_directory}[/].")
+                print_export_verification(verification)
+                return
+
+            shutil.copytree(output_model, save_directory, dirs_exist_ok=True)
+            print(f"Model saved to [bold]{save_directory}[/].")
+
         while True:
-            print(f"Running Unsloth pre-training using [bold]{input_model}[/]...")
+            print(f"Running Unsloth training using [bold]{input_model}[/]...")
             try:
                 pre_result = run_unsloth_stage(
                     pre_stage_settings,
                     input_model,
                     resume_from_checkpoint=resume_checkpoint,
+                    export_snapshot=False,
                 )
             except Exception as error:
-                print(f"[red]Pre-training failed: {error}[/]")
+                print(f"[red]Training failed: {error}[/]")
                 return
 
             output_model = pre_result.output_model
@@ -489,10 +682,10 @@ def run():
 
             if pre_result.interrupted:
                 print(
-                    f"* Pre-training interrupted. Snapshot available at [bold]{output_model}[/]."
+                    f"* Training interrupted. Snapshot available at [bold]{output_model}[/]."
                 )
                 action = prompt_select(
-                    "Pre-training interrupted. What now?",
+                    "Training interrupted. What now?",
                     [
                         "Resume training from latest checkpoint",
                         "Continue using latest checkpoint adapter",
@@ -534,18 +727,7 @@ def run():
                 if action == "Save current snapshot to a local folder":
                     save_directory = prompt_path("Path to the folder:")
                     if save_directory:
-                        if latest_checkpoint is not None:
-                            shutil.copytree(
-                                latest_checkpoint,
-                                save_directory,
-                                dirs_exist_ok=True,
-                            )
-                            print(
-                                f"Adapter checkpoint saved to [bold]{save_directory}[/]."
-                            )
-                        else:
-                            shutil.copytree(output_model, save_directory, dirs_exist_ok=True)
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                        save_pretrained_output(save_directory)
                     print()
                     continue
                 if action is None or action == "Exit (I will run later)":
@@ -559,35 +741,31 @@ def run():
                         use_checkpoint_runtime = True
                         runtime_checkpoint = latest_checkpoint
             else:
-                print(f"* Pre-training completed. Output saved to [bold]{output_model}[/].")
+                print(f"* Training completed. Output saved to [bold]{output_model}[/].")
             break
 
         while True:
             pre_action = prompt_select(
                 "What do you want to do next?",
                 [
-                    "Continue to ablation with the pre-trained model",
-                    "Save pre-trained model to a local folder",
-                    "Chat with pre-trained model",
-                    "Exit (I will run ablation later)",
+                    "Save trained model to a local folder",
+                    "Chat with trained model",
+                    "Exit",
                 ],
             )
-            if pre_action == "Continue to ablation with the pre-trained model":
-                break
-            if pre_action is None or pre_action == "Exit (I will run ablation later)":
+            if pre_action is None or pre_action == "Exit":
                 return
 
-            if pre_action == "Save pre-trained model to a local folder":
+            if pre_action == "Save trained model to a local folder":
                 save_directory = prompt_path("Path to the folder:")
                 if not save_directory:
                     continue
 
-                shutil.copytree(output_model, save_directory, dirs_exist_ok=True)
-                print(f"Model saved to [bold]{save_directory}[/].")
+                save_pretrained_output(save_directory)
                 continue
 
             print()
-            print(f"Loading pre-trained model [bold]{output_model}[/] for chat...")
+            print(f"Loading trained model [bold]{output_model}[/] for chat...")
             chat_settings = settings.model_copy(deep=True)
             if use_checkpoint_runtime and runtime_checkpoint is not None:
                 chat_settings.model = input_model
@@ -603,17 +781,6 @@ def run():
             print()
             print_memory_usage()
             chat_with_model(chat_model, chat_settings)
-
-        if use_checkpoint_runtime and runtime_checkpoint is not None:
-            settings.model = input_model
-            settings.initial_adapter_path = runtime_checkpoint
-            print(
-                f"* Continuing with base model [bold]{input_model}[/] + adapter checkpoint [bold]{runtime_checkpoint}[/]"
-            )
-        else:
-            settings.model = output_model
-            settings.initial_adapter_path = None
-        settings.quantization = prompt_runtime_quantization(settings.quantization)
 
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
@@ -1145,15 +1312,32 @@ def run():
         # Count number of complete trials to compute trials to run.
         return sum([(1 if t.state == TrialState.COMPLETE else 0) for t in study.trials])
 
+    def ensure_optimization_baselines():
+        # Make sure baseline metrics and refusal directions are computed from
+        # the clean model state (before any trial-specific abliteration).
+        print()
+        print("Preparing optimization baselines...")
+        print("* Resetting model...")
+        model.reset_model()
+        get_refusal_directions()
+        print("* Resetting model...")
+        model.reset_model()
+        evaluator = get_evaluator()
+        study.set_user_attr("bad_evaluation_prompt_count", len(evaluator.bad_prompts))
+
     start_index = trial_index = count_completed_trials()
     if start_index > 0:
         print()
         print("Resuming existing study.")
 
     try:
+        initial_trials_to_run = settings.n_trials - count_completed_trials()
+        if initial_trials_to_run > 0:
+            ensure_optimization_baselines()
+
         study.optimize(
             objective_wrapper,
-            n_trials=settings.n_trials - count_completed_trials(),
+            n_trials=initial_trials_to_run,
         )
     except KeyboardInterrupt:
         # This additional handler takes care of the small chance that KeyboardInterrupt
@@ -1264,9 +1448,13 @@ def run():
                 study.set_user_attr("finished", False)
 
                 try:
+                    additional_trials_to_run = settings.n_trials - count_completed_trials()
+                    if additional_trials_to_run > 0:
+                        ensure_optimization_baselines()
+
                     study.optimize(
                         objective_wrapper,
-                        n_trials=settings.n_trials - count_completed_trials(),
+                        n_trials=additional_trials_to_run,
                     )
                 except KeyboardInterrupt:
                     pass
@@ -1296,13 +1484,80 @@ def run():
                 },
             )
 
+            def save_decensored_model(save_mode: str):
+                save_directory = prompt_path("Path to the folder:")
+                if not save_directory:
+                    return
+
+                if save_mode == "adapter":
+                    print("Saving LoRA adapter...")
+                    model.model.save_pretrained(save_directory)
+                    print(f"Model saved to [bold]{save_directory}[/].")
+                    return
+
+                merge_base_model = None
+                if (
+                    settings.quantization == QuantizationMethod.BNB_4BIT
+                    and getattr(model, "prequantized_bnb4bit", False)
+                ):
+                    merge_base_model = prompt_text(
+                        "Full-precision base model/path for 16-bit merge:",
+                        default=suggest_full_precision_base(settings.model),
+                    )
+                    if not merge_base_model:
+                        print("[yellow]Merge cancelled.[/]")
+                        return
+
+                print("Saving merged model...")
+                merged_model = model.get_merged_model(
+                    merge_base_model=merge_base_model,
+                )
+
+                output_dir_16 = save_directory
+                output_dir_4 = suggest_4bit_export_path(save_directory)
+
+                if save_mode == "merged_4bit":
+                    temp_16_dir = tempfile.mkdtemp(prefix="heretic-merge16-")
+                    try:
+                        merged_model.save_pretrained(temp_16_dir)
+                        model.tokenizer.save_pretrained(temp_16_dir)
+                        del merged_model
+                        empty_cache()
+                        quantize_snapshot_to_4bit(
+                            model_name=temp_16_dir,
+                            output_model=save_directory,
+                        )
+                    finally:
+                        shutil.rmtree(temp_16_dir, ignore_errors=True)
+                    print(f"Model saved to [bold]{save_directory}[/].")
+                    return
+
+                merged_model.save_pretrained(output_dir_16)
+                del merged_model
+                empty_cache()
+                model.tokenizer.save_pretrained(output_dir_16)
+
+                if save_mode == "merged_16bit_4bit":
+                    quantize_snapshot_to_4bit(
+                        model_name=output_dir_16,
+                        output_model=output_dir_4,
+                    )
+                    print(
+                        f"Models saved to [bold]{output_dir_16}[/] and [bold]{output_dir_4}[/]."
+                    )
+                    return
+
+                print(f"Model saved to [bold]{save_directory}[/].")
+
             while True:
                 print()
                 action = prompt_select(
                     "What do you want to do with the decensored model?",
                     [
-                        "Train with Unsloth (config.post.toml)",
-                        "Save the model to a local folder",
+                        "Save merged model to local folder (16-bit)",
+                        "Save merged model to local folder (4-bit)",
+                        "Save merged models to local folders (16-bit + 4-bit)",
+                        "Save LoRA adapter to local folder",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
                         "Return to the trial selection menu",
@@ -1317,155 +1572,17 @@ def run():
                 # the optimized model.
                 try:
                     match action:
-                        case "Train with Unsloth (config.post.toml)":
-                            post_config = resolve_config_file("config.post.toml")
-                            post_stage_settings = load_unsloth_settings_from_file(
-                                post_config,
-                                None,
-                            )
-                            if not post_stage_settings.enabled:
-                                print("Post-training stage is disabled in config.post.toml.")
-                                continue
+                        case "Save merged model to local folder (16-bit)":
+                            save_decensored_model("merged_16bit")
 
-                            output_model_override = prompt_text(
-                                "Output path for post-training model:",
-                                default=post_stage_settings.output_model,
-                            )
-                            if output_model_override:
-                                post_stage_settings.output_model = output_model_override
+                        case "Save merged model to local folder (4-bit)":
+                            save_decensored_model("merged_4bit")
 
-                            strategy = obtain_merge_strategy(settings)
-                            if strategy is None:
-                                continue
+                        case "Save merged models to local folders (16-bit + 4-bit)":
+                            save_decensored_model("merged_16bit_4bit")
 
-                            temp_model_dir = tempfile.mkdtemp(prefix="heretic-post-")
-                            try:
-                                print("Preparing selected trial model for post-training...")
-                                merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(temp_model_dir)
-                                model.tokenizer.save_pretrained(temp_model_dir)
-                                del merged_model
-                                empty_cache()
-
-                                print(
-                                    f"Running Unsloth post-training using [bold]{temp_model_dir}[/]..."
-                                )
-                                output_model = ""
-                                resume_checkpoint = None
-                                post_checkpoint_dir = (
-                                    post_stage_settings.checkpoint_output
-                                    or f"{post_stage_settings.output_model}_checkpoints"
-                                )
-                                latest_post_checkpoint = find_latest_training_checkpoint(
-                                    post_checkpoint_dir
-                                )
-                                if latest_post_checkpoint is not None:
-                                    checkpoint_action = prompt_select(
-                                        "Found existing post-training checkpoints. How do you want to proceed?",
-                                        [
-                                            "Resume from latest checkpoint",
-                                            "Start a fresh training run",
-                                            "Cancel post-training",
-                                        ],
-                                    )
-                                    if checkpoint_action == "Resume from latest checkpoint":
-                                        resume_checkpoint = latest_post_checkpoint
-                                    elif (
-                                        checkpoint_action == "Cancel post-training"
-                                        or checkpoint_action is None
-                                    ):
-                                        output_model = None
-
-                                while True:
-                                    if output_model is None:
-                                        break
-
-                                    post_result = run_unsloth_stage(
-                                        post_stage_settings,
-                                        temp_model_dir,
-                                        resume_from_checkpoint=resume_checkpoint,
-                                    )
-                                    output_model = post_result.output_model
-                                    latest_checkpoint = post_result.latest_checkpoint
-
-                                    if not post_result.interrupted:
-                                        break
-
-                                    print(
-                                        f"* Post-training interrupted. Snapshot available at [bold]{output_model}[/]."
-                                    )
-                                    post_action = prompt_select(
-                                        "Post-training interrupted. What now?",
-                                        [
-                                            "Resume training from latest checkpoint",
-                                            "Reload current snapshot",
-                                            "Keep current in-memory model and return",
-                                        ],
-                                    )
-
-                                    if post_action == "Resume training from latest checkpoint":
-                                        if latest_checkpoint is None:
-                                            print("[yellow]No checkpoint found to resume from.[/]")
-                                            resume_checkpoint = None
-                                        else:
-                                            resume_checkpoint = latest_checkpoint
-                                        continue
-
-                                    if (
-                                        post_action is None
-                                        or post_action
-                                        == "Keep current in-memory model and return"
-                                    ):
-                                        output_model = None
-                                        break
-
-                                    # Reload current snapshot now.
-                                    break
-
-                                if output_model is None:
-                                    continue
-                            finally:
-                                shutil.rmtree(temp_model_dir, ignore_errors=True)
-
-                            print(
-                                f"* Post-training completed. Output saved to [bold]{output_model}[/]."
-                            )
-
-                            if post_stage_settings.merge_after:
-                                print("Reloading post-trained model...")
-                                settings.model = output_model
-                                settings.quantization = prompt_runtime_quantization(
-                                    settings.quantization
-                                )
-                                model = Model(settings)
-                                print()
-                                print_memory_usage()
-                            else:
-                                print(
-                                    "* Post-training produced an adapter-only output; keeping the current in-memory model for chat/save/upload."
-                                )
-
-                        case "Save the model to a local folder":
-                            save_directory = prompt_path("Path to the folder:")
-                            if not save_directory:
-                                continue
-
-                            strategy = obtain_merge_strategy(settings)
-                            if strategy is None:
-                                continue
-
-                            if strategy == "adapter":
-                                print("Saving LoRA adapter...")
-                                model.model.save_pretrained(save_directory)
-                            else:
-                                print("Saving merged model...")
-                                merged_model = model.get_merged_model()
-                                merged_model.save_pretrained(save_directory)
-                                del merged_model
-                                empty_cache()
-                                model.tokenizer.save_pretrained(save_directory)
-
-                            print(f"Model saved to [bold]{save_directory}[/].")
+                        case "Save LoRA adapter to local folder":
+                            save_decensored_model("adapter")
 
                         case "Upload the model to Hugging Face":
                             # We don't use huggingface_hub.login() because that stores the token on disk,
@@ -1512,7 +1629,22 @@ def run():
                                 )
                             else:
                                 print("Uploading merged model...")
-                                merged_model = model.get_merged_model()
+                                merge_base_model = None
+                                if (
+                                    settings.quantization == QuantizationMethod.BNB_4BIT
+                                    and getattr(model, "prequantized_bnb4bit", False)
+                                ):
+                                    merge_base_model = prompt_text(
+                                        "Full-precision base model/path for 16-bit merge:",
+                                        default=suggest_full_precision_base(settings.model),
+                                    )
+                                    if not merge_base_model:
+                                        print("[yellow]Upload cancelled.[/]")
+                                        continue
+
+                                merged_model = model.get_merged_model(
+                                    merge_base_model=merge_base_model,
+                                )
                                 merged_model.push_to_hub(
                                     repo_id,
                                     private=private,

@@ -310,7 +310,7 @@ class Model:
 
         return False
 
-    def get_merged_model(self) -> PreTrainedModel:
+    def get_merged_model(self, merge_base_model: str | None = None) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
@@ -325,13 +325,18 @@ class Model:
                 if "lora_" in name:
                     adapter_state[name] = param.data.clone().cpu()
 
+            base_model_name = merge_base_model or self.settings.model
+
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            base_model = get_model_class(self.settings.model).from_pretrained(
-                self.settings.model,
+            base_model = get_model_class(base_model_name).from_pretrained(
+                base_model_name,
                 torch_dtype=self.model.dtype,
                 device_map="cpu",
-                trust_remote_code=self.trusted_models.get(self.settings.model),
+                trust_remote_code=self.trusted_models.get(
+                    base_model_name,
+                    self.settings.trust_remote_code,
+                ),
             )
 
             # Apply LoRA adapters to the CPU model

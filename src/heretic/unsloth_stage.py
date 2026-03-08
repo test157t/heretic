@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 from dataclasses import dataclass
+import tempfile
+from typing import Any
 
 import torch
 from pydantic import BaseModel, Field
@@ -58,6 +60,8 @@ class UnslothStageSettings(BaseModel):
     lora_r: int = Field(default=16)
     lora_alpha: int = Field(default=16)
     lora_dropout: float = Field(default=0.0)
+    bias: str = Field(default="none")
+    use_gradient_checkpointing: bool | str = Field(default="unsloth")
     target_modules: list[str] = Field(
         default=[
             "q_proj",
@@ -99,10 +103,461 @@ class UnslothStageResult:
     interrupted: bool
 
 
+def _quantize_snapshot_to_4bit(model_name: str, output_model: str):
+    from transformers import AutoTokenizer, BitsAndBytesConfig
+    from .model import get_model_class
+
+    def snapshot_is_reloadable(path: Path) -> bool:
+        config_file = path / "config.json"
+        if not config_file.exists():
+            return False
+
+        weight_files = list(path.glob("*.safetensors"))
+        weight_files += list(path.glob("*.bin"))
+        return len(weight_files) > 0
+
+    output_path = Path(output_model)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    quant_model = None
+    quant_tokenizer = None
+    quant_errors = []
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+
+    for device_map in ["cuda:0", "auto", "cpu"]:
+        try:
+            quant_model = get_model_class(model_name).from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+
+            try:
+                quant_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    fix_mistral_regex=True,
+                    trust_remote_code=True,
+                )
+            except TypeError:
+                quant_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                )
+            break
+        except Exception as error:
+            quant_errors.append((device_map, error))
+
+    if quant_model is None or quant_tokenizer is None:
+        details = (
+            "; ".join([f"{device_map}: {error}" for device_map, error in quant_errors])
+            if quant_errors
+            else "unknown error"
+        )
+        raise RuntimeError(
+            "Failed to quantize merged model to 4-bit. "
+            f"Details: {details}"
+        )
+
+    quant_model.save_pretrained(str(output_path))
+    quant_tokenizer.save_pretrained(str(output_path))
+
+    if not snapshot_is_reloadable(output_path):
+        raise RuntimeError("4-bit export did not produce a reloadable snapshot")
+
+    del quant_model, quant_tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def quantize_snapshot_to_4bit(model_name: str, output_model: str):
+    _quantize_snapshot_to_4bit(model_name=model_name, output_model=output_model)
+
+
+def _collect_lora_signal_stats(peft_model: Any) -> dict[str, float | int]:
+    lora_a_tensors = 0
+    lora_b_tensors = 0
+    lora_b_nonzero_tensors = 0
+    lora_b_abs_sum = 0.0
+    lora_b_abs_max = 0.0
+
+    for name, param in peft_model.named_parameters():
+        if "lora_A" in name:
+            lora_a_tensors += 1
+        if "lora_B" not in name:
+            continue
+
+        lora_b_tensors += 1
+        data = param.detach().float().cpu()
+        abs_sum = float(data.abs().sum().item())
+        abs_max = float(data.abs().max().item())
+        lora_b_abs_sum += abs_sum
+        lora_b_abs_max = max(lora_b_abs_max, abs_max)
+        if abs_max > 0.0:
+            lora_b_nonzero_tensors += 1
+
+    return {
+        "lora_a_tensors": lora_a_tensors,
+        "lora_b_tensors": lora_b_tensors,
+        "lora_b_nonzero_tensors": lora_b_nonzero_tensors,
+        "lora_b_abs_sum": lora_b_abs_sum,
+        "lora_b_abs_max": lora_b_abs_max,
+    }
+
+
+def _sample_lora_target_snapshots(
+    peft_model: Any,
+    max_params: int = 16,
+) -> dict[str, torch.Tensor]:
+    snapshots = {}
+
+    for module_name, module in peft_model.named_modules():
+        if len(snapshots) >= max_params:
+            break
+        if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+            continue
+        if not hasattr(module, "base_layer") or not hasattr(module.base_layer, "weight"):
+            continue
+
+        weight = module.base_layer.weight
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if not torch.is_floating_point(weight):
+            continue
+
+        merged_weight_name = f"{module_name}.weight"
+        snapshots[merged_weight_name] = weight.detach().float().cpu().clone()
+
+    return snapshots
+
+
+def _compare_parameter_deltas(
+    merged_model: Any,
+    snapshots: dict[str, torch.Tensor],
+) -> dict[str, Any]:
+    if not snapshots:
+        return {
+            "compared_count": 0,
+            "changed_count": 0,
+            "max_mean_abs_delta": 0.0,
+            "mean_abs_delta": 0.0,
+            "samples": [],
+        }
+
+    merged_params = dict(merged_model.named_parameters())
+
+    def resolve_param(name: str):
+        after = merged_params.get(name)
+        if after is not None:
+            return after, name
+
+        candidate_names = [name]
+        for prefix in ["base_model.model.", "base_model."]:
+            if name.startswith(prefix):
+                candidate_names.append(name[len(prefix) :])
+
+        for candidate in candidate_names:
+            after = merged_params.get(candidate)
+            if after is not None:
+                return after, candidate
+
+        # Last resort: unique suffix match for wrapped model naming differences.
+        for candidate in candidate_names:
+            suffix_matches = [
+                merged_name
+                for merged_name in merged_params
+                if merged_name.endswith(candidate)
+            ]
+            if len(suffix_matches) == 1:
+                matched_name = suffix_matches[0]
+                return merged_params[matched_name], matched_name
+
+        return None, None
+
+    samples = []
+    mean_deltas = []
+
+    for name, before in snapshots.items():
+        after, resolved_name = resolve_param(name)
+        if after is None:
+            continue
+
+        after_cpu = after.detach().float().cpu()
+        mean_abs_delta = float((after_cpu - before).abs().mean().item())
+        label = resolved_name if resolved_name is not None else name
+        samples.append((label, mean_abs_delta))
+        mean_deltas.append(mean_abs_delta)
+
+    compared_count = len(samples)
+    changed_count = len([delta for _, delta in samples if delta > 1e-8])
+    max_mean_abs_delta = max((delta for _, delta in samples), default=0.0)
+    mean_abs_delta = float(sum(mean_deltas) / len(mean_deltas)) if mean_deltas else 0.0
+
+    return {
+        "compared_count": compared_count,
+        "changed_count": changed_count,
+        "max_mean_abs_delta": max_mean_abs_delta,
+        "mean_abs_delta": mean_abs_delta,
+        "samples": samples,
+    }
+
+
+def export_unsloth_checkpoint_snapshot(
+    base_model: str,
+    adapter_checkpoint: str,
+    output_model: str,
+    save_method: str,
+    merge_base_model: str | None = None,
+):
+    base_model = str(base_model)
+    adapter_checkpoint = str(adapter_checkpoint)
+    if merge_base_model is not None:
+        merge_base_model = str(merge_base_model)
+
+    def snapshot_is_reloadable(path: Path) -> bool:
+        config_file = path / "config.json"
+        if not config_file.exists():
+            return False
+
+        weight_files = list(path.glob("*.safetensors"))
+        weight_files += list(path.glob("*.bin"))
+        return len(weight_files) > 0
+
+    from peft import PeftModel
+    from transformers import AutoTokenizer
+    from transformers import PretrainedConfig
+    from unsloth import FastLanguageModel
+    from .model import get_model_class
+
+    def load_export_tokenizer() -> Any:
+        candidate_models: list[str] = []
+        for candidate in [adapter_checkpoint, model_for_export, base_model]:
+            if not candidate:
+                continue
+            if candidate in candidate_models:
+                continue
+            candidate_models.append(candidate)
+
+        last_error = None
+        for candidate in candidate_models:
+            try:
+                try:
+                    return AutoTokenizer.from_pretrained(
+                        candidate,
+                        fix_mistral_regex=True,
+                    )
+                except TypeError:
+                    return AutoTokenizer.from_pretrained(candidate)
+            except Exception as error:
+                last_error = error
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Could not load tokenizer for checkpoint export")
+
+    def is_prequantized_bnb4bit(model_name: str) -> bool:
+        if not isinstance(model_name, str):
+            model_name = str(model_name)
+
+        try:
+            config_dict, _ = PretrainedConfig.get_config_dict(model_name)
+        except Exception:
+            return False
+
+        quant_config = config_dict.get("quantization_config")
+        if not isinstance(quant_config, dict):
+            return False
+        return (
+            quant_config.get("load_in_4bit") is True
+            or quant_config.get("quant_method") == "bitsandbytes"
+        )
+
+    model_for_export = merge_base_model or base_model
+
+    if save_method == "merged_16bit" and is_prequantized_bnb4bit(model_for_export):
+        raise RuntimeError(
+            "Cannot export merged 16-bit directly from a pre-quantized 4-bit base model. "
+            "Provide a full-precision base model/path for 16-bit merge."
+        )
+
+    prequantized_export_base = is_prequantized_bnb4bit(model_for_export)
+
+    load_in_4bit = save_method in ["merged_4bit", "forced_merged_4bit", "merged_4bit_forced"]
+    if load_in_4bit and not prequantized_export_base:
+        # If we're exporting 4-bit from a full-precision base, keep the model
+        # in full precision and let save_pretrained_merged handle quantization.
+        load_in_4bit = False
+
+    output_path = Path(output_model)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if save_method == "merged_16bit":
+        # For full-precision export, avoid Unsloth merge path and use a plain
+        # Transformers + PEFT merge. This is more robust for adapter checkpoints.
+        base = get_model_class(model_for_export).from_pretrained(
+            model_for_export,
+            dtype=torch.bfloat16,
+            device_map="cpu",
+        )
+        peft_model = PeftModel.from_pretrained(
+            base,
+            adapter_checkpoint,
+            is_trainable=False,
+            device_map=None,
+            low_cpu_mem_usage=False,
+            autocast_adapter_dtype=False,
+        )
+
+        lora_signal = _collect_lora_signal_stats(peft_model)
+        base_snapshots = _sample_lora_target_snapshots(peft_model, max_params=16)
+        merged_model = peft_model.merge_and_unload()
+        merge_deltas = _compare_parameter_deltas(merged_model, base_snapshots)
+
+        tokenizer = load_export_tokenizer()
+
+        merged_model.save_pretrained(str(output_path))
+        tokenizer.save_pretrained(str(output_path))
+
+        verification = {
+            "lora_signal": lora_signal,
+            "merge_deltas": merge_deltas,
+        }
+
+        del merged_model, peft_model, base, tokenizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return verification
+
+    model = None
+    tokenizer = None
+
+    load_errors = []
+    load_attempts = ["cuda:0", "auto", "cpu"]
+    for device_map in load_attempts:
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=model_for_export,
+                max_seq_length=4096,
+                dtype=None,
+                load_in_4bit=load_in_4bit,
+                device_map=device_map,
+            )
+            break
+        except Exception as error:
+            load_errors.append((device_map, error))
+
+    if model is None or tokenizer is None:
+        details = (
+            "; ".join([f"{device_map}: {error}" for device_map, error in load_errors])
+            if load_errors
+            else "unknown error"
+        )
+        raise RuntimeError(
+            "Failed to load base model for checkpoint export. "
+            "This is usually a hardware/offload limitation for very large models. "
+            "Try exporting on a machine with more VRAM/RAM, or keep using the adapter checkpoint directly. "
+            f"Details: {details}"
+        ) from (load_errors[-1][1] if load_errors else None)
+
+    try:
+        tokenizer = load_export_tokenizer()
+    except Exception:
+        # Keep tokenizer returned by FastLanguageModel as fallback.
+        pass
+
+    try:
+        model = PeftModel.from_pretrained(
+            model,
+            adapter_checkpoint,
+            is_trainable=False,
+            device_map=None,
+            low_cpu_mem_usage=False,
+            autocast_adapter_dtype=False,
+        )
+    except TypeError:
+        # Older PEFT versions may not support some kwargs.
+        model = PeftModel.from_pretrained(
+            model,
+            adapter_checkpoint,
+            is_trainable=False,
+        )
+
+    save_methods = [save_method]
+    if save_method == "merged_4bit":
+        if prequantized_export_base:
+            save_methods = ["merged_4bit", "forced_merged_4bit", "merged_4bit_forced"]
+        else:
+            save_methods = ["forced_merged_4bit", "merged_4bit", "merged_4bit_forced"]
+
+    last_error = None
+    for method in save_methods:
+        try:
+            if hasattr(model, "save_pretrained_merged"):
+                model.save_pretrained_merged(
+                    str(output_path),
+                    tokenizer,
+                    save_method=method,
+                )
+            else:
+                raise RuntimeError("save_pretrained_merged is not available on this adapter model")
+
+            tokenizer.save_pretrained(str(output_path))
+            if snapshot_is_reloadable(output_path):
+                last_error = None
+                break
+
+            last_error = RuntimeError(f"Save method '{method}' did not produce a reloadable snapshot")
+        except Exception as error:
+            last_error = error
+
+    del model, tokenizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if last_error is not None:
+        raise RuntimeError(
+            f"Failed to export checkpoint snapshot with methods {save_methods}."
+        ) from last_error
+
+    return None
+
+
+def export_unsloth_checkpoint_snapshot_dual(
+    base_model: str,
+    adapter_checkpoint: str,
+    output_model_16bit: str,
+    output_model_4bit: str,
+    merge_base_model: str | None = None,
+):
+    verification = export_unsloth_checkpoint_snapshot(
+        base_model=base_model,
+        adapter_checkpoint=adapter_checkpoint,
+        output_model=output_model_16bit,
+        save_method="merged_16bit",
+        merge_base_model=merge_base_model,
+    )
+
+    # Quantize from the verified merged 16-bit snapshot to avoid
+    # adapter re-attachment edge cases during combined export.
+    _quantize_snapshot_to_4bit(
+        model_name=output_model_16bit,
+        output_model=output_model_4bit,
+    )
+
+    return verification
+
+
 def run_unsloth_stage(
     settings: UnslothStageSettings,
     input_model: str,
     resume_from_checkpoint: str | None = None,
+    export_snapshot: bool = True,
 ) -> UnslothStageResult:
     dataset_ids = []
     if settings.dataset is not None:
@@ -270,8 +725,8 @@ def run_unsloth_stage(
         "target_modules": settings.target_modules,
         "lora_alpha": settings.lora_alpha,
         "lora_dropout": settings.lora_dropout,
-        "bias": "none",
-        "use_gradient_checkpointing": "unsloth",
+        "bias": settings.bias,
+        "use_gradient_checkpointing": settings.use_gradient_checkpointing,
         "random_state": settings.seed,
     }
 
@@ -280,6 +735,17 @@ def run_unsloth_stage(
     except TypeError:
         peft_kwargs.pop("random_state", None)
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+
+    # Keep training memory footprint low regardless of backend defaults.
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    wants_checkpointing = settings.use_gradient_checkpointing not in [False, "false", "False"]
+    if wants_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
 
     loaded_datasets = []
     for index, dataset_id in enumerate(dataset_ids):
@@ -482,13 +948,14 @@ def run_unsloth_stage(
         output_dir=str(checkpoint_path),
         per_device_train_batch_size=settings.batch_size,
         gradient_accumulation_steps=settings.gradient_accumulation_steps,
+        gradient_checkpointing=wants_checkpointing,
         warmup_steps=effective_warmup_steps,
         learning_rate=settings.learning_rate,
         num_train_epochs=settings.epochs,
         max_steps=settings.max_steps,
         logging_steps=settings.logging_steps,
         save_steps=settings.save_steps,
-        optim="adamw_8bit",
+        optim="paged_adamw_8bit",
         max_grad_norm=settings.max_grad_norm,
         weight_decay=0.01,
         lr_scheduler_type=settings.lr_scheduler_type,
@@ -513,13 +980,14 @@ def run_unsloth_stage(
                 "output_dir": str(checkpoint_path),
                 "per_device_train_batch_size": settings.batch_size,
                 "gradient_accumulation_steps": settings.gradient_accumulation_steps,
+                "gradient_checkpointing": wants_checkpointing,
                 "warmup_steps": effective_warmup_steps,
                 "learning_rate": settings.learning_rate,
                 "num_train_epochs": settings.epochs,
                 "max_steps": settings.max_steps,
                 "logging_steps": settings.logging_steps,
                 "save_steps": settings.save_steps,
-                "optim": "adamw_8bit",
+                "optim": "paged_adamw_8bit",
                 "max_grad_norm": settings.max_grad_norm,
                 "weight_decay": 0.01,
                 "lr_scheduler_type": settings.lr_scheduler_type,
@@ -676,28 +1144,32 @@ def run_unsloth_stage(
     latest_checkpoint = find_latest_checkpoint(checkpoint_path)
 
     resolved_output_model = str(output_path)
-    if interrupted:
-        # Do not force a merge/export when the user interrupts training.
-        # Use the latest adapter checkpoint directly for chat/resume/continue.
-        if latest_checkpoint is not None:
-            resolved_output_model = latest_checkpoint
+
+    # Prefer checkpoint output for interactive stage handling.
+    if latest_checkpoint is not None:
+        resolved_output_model = latest_checkpoint
+        if interrupted:
             print(
                 f"* Using latest adapter checkpoint [bold]{latest_checkpoint}[/] as interrupted snapshot"
             )
+
+    if export_snapshot:
+        if interrupted:
+            # Do not force a merge/export when the user interrupts training.
+            # Keep working from checkpoint artifacts.
+            pass
         else:
-            # Fallback only if no checkpoint exists for some reason.
-            export_model_snapshot()
-    else:
-        try:
-            export_model_snapshot()
-        except Exception as error:
-            if latest_checkpoint is not None:
-                print(
-                    f"[yellow]* Snapshot export failed ({error}). Falling back to latest adapter checkpoint [bold]{latest_checkpoint}[/].[/]"
-                )
-                resolved_output_model = latest_checkpoint
-            else:
-                raise
+            try:
+                export_model_snapshot()
+                resolved_output_model = str(output_path)
+            except Exception as error:
+                if latest_checkpoint is not None:
+                    print(
+                        f"[yellow]* Snapshot export failed ({error}). Falling back to latest adapter checkpoint [bold]{latest_checkpoint}[/].[/]"
+                    )
+                    resolved_output_model = latest_checkpoint
+                else:
+                    raise
 
     # Ensure references are released before downstream model reload.
     del trainer, model, tokenizer

@@ -27,3 +27,7 @@ wheels/
 /outputs
 /Qwen3.5-4B_Homebrew
 /unsloth_compiled_cache
+/Qwen3.5-27B_Homebrew1-bf16
+/Qwen3.5-27B_Homebrew1-bnb-4bit
+/Qwen3.5-27B_Homebrew2-bnb-bf16
+/Qwen3.5-27B_Homebrew2-bnb-bnb-4bit
