@@ -130,7 +130,13 @@ def _quantize_snapshot_to_4bit(model_name: str, output_model: str):
         bnb_4bit_use_double_quant=True,
     )
 
-    for device_map in ["cuda:0", "auto", "cpu"]:
+    device_maps: list[str] = ["auto"]
+    if not torch.cuda.is_available():
+        device_maps = ["cpu"]
+    else:
+        device_maps.append("cpu")
+
+    for index, device_map in enumerate(device_maps):
         try:
             quant_model = get_model_class(model_name).from_pretrained(
                 model_name,
@@ -153,6 +159,10 @@ def _quantize_snapshot_to_4bit(model_name: str, output_model: str):
             break
         except Exception as error:
             quant_errors.append((device_map, error))
+            if index < len(device_maps) - 1:
+                print(
+                    f"[yellow]Quantization load with device_map='{device_map}' failed ({error}). Retrying...[/]"
+                )
 
     if quant_model is None or quant_tokenizer is None:
         details = (
