@@ -153,6 +153,26 @@ def find_latest_training_checkpoint(checkpoint_dir: str) -> str | None:
     return str(checkpoints[-1][1])
 
 
+def find_all_training_checkpoints(checkpoint_dir: str) -> list[str]:
+    """Find all training checkpoints in the given directory, sorted by step number."""
+    root = Path(checkpoint_dir)
+    if not root.exists():
+        return []
+
+    checkpoints = []
+    for entry in root.glob("checkpoint-*"):
+        if not entry.is_dir():
+            continue
+        try:
+            step = int(entry.name.split("-")[-1])
+        except Exception:
+            continue
+        checkpoints.append((step, str(entry)))
+
+    checkpoints.sort(key=lambda item: item[0])
+    return [path for _, path in checkpoints]
+
+
 def configure_hf_token_for_session():
     existing_token = huggingface_hub.get_token()
 
@@ -507,29 +527,6 @@ def run():
 
         input_model = pre_stage_settings.model or settings.model
         print()
-        resume_checkpoint = None
-        pre_checkpoint_dir = (
-            pre_stage_settings.checkpoint_output
-            or f"{pre_stage_settings.output_model}_checkpoints"
-        )
-        latest_pre_checkpoint = find_latest_training_checkpoint(pre_checkpoint_dir)
-        if latest_pre_checkpoint is not None:
-            checkpoint_action = prompt_select(
-                "Found existing training checkpoints. How do you want to proceed?",
-                [
-                    "Resume from latest checkpoint",
-                    "Start a fresh training run",
-                    "Exit",
-                ],
-            )
-            if checkpoint_action == "Resume from latest checkpoint":
-                resume_checkpoint = latest_pre_checkpoint
-            elif checkpoint_action == "Exit" or checkpoint_action is None:
-                return
-
-        use_checkpoint_runtime = False
-        runtime_checkpoint = None
-
         def print_export_verification(report):
             if not isinstance(report, dict):
                 return
@@ -565,6 +562,169 @@ def run():
             else:
                 print("[green]  * Adapter signal and merge deltas look non-zero.[/]")
 
+        resume_checkpoint = None
+        pre_checkpoint_dir = (
+            pre_stage_settings.checkpoint_output
+            or f"{pre_stage_settings.output_model}_checkpoints"
+        )
+        all_checkpoints = find_all_training_checkpoints(pre_checkpoint_dir)
+        if all_checkpoints:
+            checkpoint_options = [
+                "Start a fresh training run",
+                "Select a specific checkpoint",
+                "Exit",
+            ]
+            checkpoint_action = prompt_select(
+                "Found existing training checkpoints. How do you want to proceed?",
+                checkpoint_options,
+            )
+            if checkpoint_action == "Select a specific checkpoint":
+                checkpoint_choices = [
+                    f"Step {Path(cp).name.split('-')[-1]}: {cp}" for cp in all_checkpoints
+                ]
+                selected_index = prompt_select(
+                    "Select a checkpoint:",
+                    checkpoint_choices,
+                )
+                if selected_index is not None:
+                    selected_checkpoint = all_checkpoints[checkpoint_choices.index(selected_index)]
+                    
+                    # Ask what to do with the selected checkpoint
+                    selected_action = prompt_select(
+                        f"What do you want to do with checkpoint [bold]{Path(selected_checkpoint).name}[/]?",
+                        [
+                            "Resume training from this checkpoint",
+                            "Chat with this checkpoint",
+                            "Save this checkpoint to a local folder",
+                            "Go back",
+                        ],
+                    )
+                    
+                    if selected_action == "Resume training from this checkpoint":
+                        resume_checkpoint = selected_checkpoint
+                    elif selected_action == "Chat with this checkpoint":
+                        # Chat with the selected checkpoint
+                        print()
+                        print("Loading checkpoint for chat...")
+                        chat_settings = settings.model_copy(deep=True)
+                        chat_settings.model = input_model
+                        chat_settings.initial_adapter_path = selected_checkpoint
+                        print(
+                            f"* Using base model [bold]{input_model}[/] with adapter checkpoint [bold]{selected_checkpoint}[/]"
+                        )
+                        chat_model = Model(chat_settings)
+                        print()
+                        print_memory_usage()
+                        chat_with_model(chat_model, chat_settings)
+                        print()
+                        return
+                    elif selected_action == "Save this checkpoint to a local folder":
+                        # Save the selected checkpoint to a local folder with merging options
+                        save_mode = prompt_select(
+                            "How do you want to save the checkpoint?",
+                            [
+                                "Merged full model (16-bit)",
+                                "Merged full model (4-bit)",
+                                "Merged full models (16-bit + 4-bit)",
+                            ],
+                        )
+                        
+                        suggested_base = suggest_full_precision_base(input_model)
+                        
+                        if save_mode == "Merged full models (16-bit + 4-bit)":
+                            merge_base_model = prompt_text(
+                                "Full-precision base model/path for merged exports (required for pre-quantized bases):",
+                                default=suggested_base,
+                            )
+                            if merge_base_model is not None:
+                                merge_base_model = merge_base_model.strip()
+                            if not merge_base_model:
+                                print("[yellow]Combined export cancelled.[/]")
+                                return
+                            
+                            save_directory_16 = prompt_text(
+                                "Save 16-bit merged model to folder:",
+                                default=f"outputs/{Path(selected_checkpoint).name}-16bit",
+                            )
+                            if not save_directory_16:
+                                print("[yellow]Export cancelled.[/]")
+                                return
+                            
+                            save_directory_4 = suggest_4bit_export_path(save_directory_16)
+                            print(
+                                f"Exporting merged 16-bit and 4-bit models from checkpoint [bold]{selected_checkpoint}[/]..."
+                            )
+                            print(f"* 16-bit output: [bold]{save_directory_16}[/]")
+                            print(f"* 4-bit output: [bold]{save_directory_4}[/]")
+                            verification = export_unsloth_checkpoint_snapshot_dual(
+                                base_model=input_model,
+                                adapter_checkpoint=selected_checkpoint,
+                                output_model_16bit=save_directory_16,
+                                output_model_4bit=save_directory_4,
+                                merge_base_model=merge_base_model,
+                            )
+                            print(
+                                f"Merged models saved to [bold]{save_directory_16}[/] and [bold]{save_directory_4}[/]."
+                            )
+                            print_export_verification(verification)
+                            return
+                        
+                        save_method = (
+                            "merged_16bit"
+                            if save_mode == "Merged full model (16-bit)"
+                            else "merged_4bit"
+                        )
+                        merge_base_model = None
+                        if save_method == "merged_16bit":
+                            merge_base_model = prompt_text(
+                                "Full-precision base model/path for 16-bit merge (required for pre-quantized bases):",
+                                default=suggested_base,
+                            )
+                            if not merge_base_model:
+                                print("[yellow]16-bit merge cancelled.[/]")
+                                return
+                        else:
+                            merge_base_model = prompt_text(
+                                "Optional full-precision base model/path for 4-bit export (recommended for pre-quantized bases):",
+                                default=suggested_base,
+                            )
+                            if merge_base_model == "":
+                                merge_base_model = None
+                        
+                        save_directory = prompt_text(
+                            "Save merged model to folder:",
+                            default=f"outputs/{Path(selected_checkpoint).name}-merged",
+                        )
+                        if not save_directory:
+                            print("[yellow]Export cancelled.[/]")
+                            return
+                        
+                        print(
+                            f"Exporting merged model from checkpoint [bold]{selected_checkpoint}[/]..."
+                        )
+                        verification = export_unsloth_checkpoint_snapshot(
+                            base_model=input_model,
+                            adapter_checkpoint=selected_checkpoint,
+                            output_model=save_directory,
+                            save_method=save_method,
+                            merge_base_model=merge_base_model,
+                        )
+                        print(f"Merged model saved to [bold]{save_directory}[/].")
+                        print_export_verification(verification)
+                        return
+                    else:
+                        # Go back or cancel
+                        return
+                else:
+                    return
+            elif checkpoint_action == "Start a fresh training run":
+                resume_checkpoint = None
+            elif checkpoint_action == "Exit" or checkpoint_action is None:
+                return
+
+        use_checkpoint_runtime = False
+        runtime_checkpoint = None
+
         def save_pretrained_output(save_directory: str):
             if use_checkpoint_runtime and runtime_checkpoint is not None:
                 save_mode = prompt_select(
@@ -573,20 +733,10 @@ def run():
                         "Merged full model (16-bit)",
                         "Merged full model (4-bit)",
                         "Merged full models (16-bit + 4-bit)",
-                        "Adapter checkpoint only",
                     ],
                 )
 
                 suggested_base = suggest_full_precision_base(input_model)
-
-                if save_mode == "Adapter checkpoint only":
-                    shutil.copytree(
-                        runtime_checkpoint,
-                        save_directory,
-                        dirs_exist_ok=True,
-                    )
-                    print(f"Adapter checkpoint saved to [bold]{save_directory}[/].")
-                    return
 
                 if save_mode == "Merged full models (16-bit + 4-bit)":
                     merge_base_model = prompt_text(

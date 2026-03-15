@@ -325,6 +325,13 @@ def export_unsloth_checkpoint_snapshot(
     save_method: str,
     merge_base_model: str | None = None,
 ):
+    from pathlib import Path
+    from peft import PeftModel
+    from transformers import AutoTokenizer
+    from transformers import PretrainedConfig
+    from unsloth import FastLanguageModel
+    from .model import get_model_class
+    
     base_model = str(base_model)
     adapter_checkpoint = str(adapter_checkpoint)
     if merge_base_model is not None:
@@ -339,13 +346,45 @@ def export_unsloth_checkpoint_snapshot(
         weight_files += list(path.glob("*.bin"))
         return len(weight_files) > 0
 
-    from peft import PeftModel
-    from transformers import AutoTokenizer
-    from transformers import PretrainedConfig
-    from unsloth import FastLanguageModel
-    from .model import get_model_class
-
     def load_export_tokenizer() -> Any:
+        # Try to load tokenizer from checkpoint directory first
+        # The checkpoint directory should contain the tokenizer with the chat template
+        checkpoint_dir = Path(adapter_checkpoint)
+        checkpoint_tokenizer = None
+        if checkpoint_dir.exists():
+            try:
+                try:
+                    checkpoint_tokenizer = AutoTokenizer.from_pretrained(
+                        str(checkpoint_dir),
+                        fix_mistral_regex=True,
+                    )
+                except TypeError:
+                    checkpoint_tokenizer = AutoTokenizer.from_pretrained(
+                        str(checkpoint_dir),
+                    )
+                print(f"* Loaded tokenizer from checkpoint directory: {checkpoint_dir}")
+                return checkpoint_tokenizer
+            except Exception as e:
+                print(f"[yellow]* Could not load tokenizer from checkpoint directory: {e}[/]")
+        
+        # Try parent directory as fallback
+        parent_dir = Path(adapter_checkpoint).parent
+        if parent_dir.exists():
+            try:
+                try:
+                    checkpoint_tokenizer = AutoTokenizer.from_pretrained(
+                        str(parent_dir),
+                        fix_mistral_regex=True,
+                    )
+                except TypeError:
+                    checkpoint_tokenizer = AutoTokenizer.from_pretrained(
+                        str(parent_dir),
+                    )
+                print(f"* Loaded tokenizer from parent directory: {parent_dir}")
+                return checkpoint_tokenizer
+            except Exception as e:
+                print(f"[yellow]* Could not load tokenizer from parent directory: {e}[/]")
+        
         candidate_models: list[str] = []
         for candidate in [adapter_checkpoint, model_for_export, base_model]:
             if not candidate:
@@ -358,12 +397,37 @@ def export_unsloth_checkpoint_snapshot(
         for candidate in candidate_models:
             try:
                 try:
-                    return AutoTokenizer.from_pretrained(
+                    tokenizer = AutoTokenizer.from_pretrained(
                         candidate,
                         fix_mistral_regex=True,
                     )
                 except TypeError:
-                    return AutoTokenizer.from_pretrained(candidate)
+                    tokenizer = AutoTokenizer.from_pretrained(candidate)
+                
+                # Ensure chat template is loaded from the tokenizer's configuration
+                # The chat_template attribute should be set from the tokenizer_config.json
+                import json
+                
+                candidate_path = Path(candidate)
+                if candidate_path.exists():
+                    tokenizer_config_path = candidate_path / "tokenizer_config.json"
+                    if tokenizer_config_path.exists():
+                        try:
+                            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                                config = json.load(f)
+                                if "chat_template" in config:
+                                    tokenizer.chat_template = config["chat_template"]
+                                    # Debug: print chat template status
+                                    template_preview = (
+                                        str(config["chat_template"])[:100] + "..."
+                                        if len(str(config["chat_template"])) > 100
+                                        else str(config["chat_template"])
+                                    )
+                                    print(f"* Loaded chat template from {candidate}: {template_preview}")
+                        except Exception as e:
+                            print(f"[yellow]* Warning: could not read tokenizer_config.json from {candidate}: {e}[/]")
+                
+                return tokenizer
             except Exception as error:
                 last_error = error
 
@@ -636,6 +700,50 @@ def run_unsloth_stage(
                             tokenizer,
                             save_method=save_method,
                         )
+                        
+                        # Ensure chat template is properly saved with the tokenizer
+                        # Explicitly set the chat_template attribute before saving
+                        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                            # Chat template is already set, this will be saved
+                            pass
+                        else:
+                            # Try to get chat template from the tokenizer's configuration
+                            try:
+                                import json
+                                
+                                # Check if tokenizer_config.json exists and has chat_template
+                                candidate_path = Path(input_model)
+                                if candidate_path.exists():
+                                    tokenizer_config_path = candidate_path / "tokenizer_config.json"
+                                    if tokenizer_config_path.exists():
+                                        with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                                            config = json.load(f)
+                                            if "chat_template" in config:
+                                                tokenizer.chat_template = config["chat_template"]
+                            except Exception:
+                                pass
+                        
+                        # Debug: check if chat template is saved
+                        import json
+                        
+                        output_path_obj = Path(output_path)
+                        tokenizer_config_path = output_path_obj / "tokenizer_config.json"
+                        if tokenizer_config_path.exists():
+                            try:
+                                with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+                                    config = json.load(f)
+                                    if "chat_template" in config:
+                                        template_preview = (
+                                            str(config["chat_template"])[:100] + "..."
+                                            if len(str(config["chat_template"])) > 100
+                                            else str(config["chat_template"])
+                                        )
+                                        print(f"* Chat template saved: {template_preview}")
+                                    else:
+                                        print("[yellow]* Warning: chat_template not found in tokenizer_config.json[/]")
+                            except Exception as e:
+                                print(f"[yellow]* Warning: could not read tokenizer_config.json: {e}[/]")
+                        
                         tokenizer.save_pretrained(str(output_path))
 
                         if snapshot_is_reloadable(output_path):
@@ -796,6 +904,31 @@ def run_unsloth_stage(
                 },
                 map_eos_token=settings.chat_template_map_eos_token,
             )
+            
+            # Ensure the chat template is properly saved with the tokenizer
+            # The get_chat_template function modifies the tokenizer's chat_template attribute
+            # but we need to make sure it's persisted
+            if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+                # Chat template is set, this should be saved with the tokenizer
+                pass
+            else:
+                # Fallback: try to set the chat template manually
+                try:
+                    from unsloth.chat_templates import get_template
+                    template = get_template(settings.chat_template_name)
+                    if template:
+                        tokenizer.chat_template = template
+                except Exception:
+                    pass
+            
+            # Debug: print chat template status
+            if hasattr(tokenizer, "chat_template"):
+                template_preview = (
+                    str(tokenizer.chat_template)[:100] + "..."
+                    if len(str(tokenizer.chat_template)) > 100
+                    else str(tokenizer.chat_template)
+                )
+                print(f"* Chat template set: {template_preview}")
         except Exception as error:
             raise RuntimeError(
                 "Failed to apply Unsloth chat template mapping. Check chat template and role/content mapping in stage config."
@@ -1149,8 +1282,23 @@ def run_unsloth_stage(
         interrupted = True
         print("\n[yellow]Training interrupted by user.[/]")
         trainer.save_state()
+        # Save tokenizer to checkpoint directory when interrupted
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        try:
+            tokenizer.save_pretrained(str(checkpoint_path))
+            print(f"* Saved tokenizer to checkpoint directory: {checkpoint_path}")
+        except Exception as e:
+            print(f"[yellow]* Warning: could not save tokenizer to checkpoint directory: {e}[/]")
 
     checkpoint_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save tokenizer to checkpoint directory after training completes
+    try:
+        tokenizer.save_pretrained(str(checkpoint_path))
+        print(f"* Saved tokenizer to checkpoint directory: {checkpoint_path}")
+    except Exception as e:
+        print(f"[yellow]* Warning: could not save tokenizer to checkpoint directory: {e}[/]")
+    
     latest_checkpoint = find_latest_checkpoint(checkpoint_path)
 
     resolved_output_model = str(output_path)

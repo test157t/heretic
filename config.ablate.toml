@@ -31,7 +31,7 @@ device_map = "auto"
 batch_size = 16  # auto
 
 # Maximum batch size to try when automatically determining the optimal batch size.
-max_batch_size = 128
+max_batch_size = 32
 
 # Maximum number of tokens to generate for each response.
 max_response_length = 100

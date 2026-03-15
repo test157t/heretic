@@ -5,7 +5,7 @@
 enabled = true
 
 # Training dataset for Unsloth.
-dataset = "Nitral-AI/Control-2048"
+dataset = "Nitral-AI/Decensor-2048"
 # Or provide multiple datasets and disable/ignore `dataset` if preferred.
 # datasets = ["Nitral-AI/Instruct_2.6.7_2048", "another/dataset"]
 dataset_split = "train"
@@ -13,8 +13,8 @@ text_column = "text"
 
 # Randomization / sampling controls.
 shuffle_dataset = true
-seed = 0
-sample_size = 512
+seed = 42
+sample_size = 1024
 
 # Dataset formatting mode: "text" or "chatml".
 dataset_format = "chatml"
@@ -42,24 +42,19 @@ bf16 = false
 fp16 = false
 # The dataset targets 2048 context; use extra room for template/control tokens.
 max_seq_length = 2560
-batch_size = 1
+batch_size = 2
 gradient_accumulation_steps = 4
-learning_rate = 3e-5
-epochs = 2
-# Set to -1 to train by epochs. Any positive value overrides epochs.
-max_steps = -1
+learning_rate = 7e-5
+epochs = 1
 max_grad_norm = 2.0
-# Use either warmup_steps or warmup_ratio. If warmup_ratio is set,
-# it takes precedence and warmup_steps is ignored.
-# warmup_steps = 5
 warmup_ratio = 0.07
 lr_scheduler_type = "cosine"
 logging_steps = 10
 save_steps = 10
 
 # LoRA template knobs.
-lora_r = 8
-lora_alpha = 16
+lora_r = 32
+lora_alpha = 32
 lora_dropout = 0.0
 # Supports "none", "all", "lora_only".
 bias = "none"
