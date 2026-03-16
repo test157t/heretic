@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
+import json
 import math
 import os
 import re
@@ -171,6 +172,26 @@ def find_all_training_checkpoints(checkpoint_dir: str) -> list[str]:
 
     checkpoints.sort(key=lambda item: item[0])
     return [path for _, path in checkpoints]
+
+
+def get_checkpoint_loss(checkpoint_path: str) -> float | None:
+    try:
+        trainer_state_file = Path(checkpoint_path) / "trainer_state.json"
+        if trainer_state_file.exists():
+            with open(trainer_state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                log_history = state.get("log_history", [])
+                if log_history:
+                    # Find the last entry with a loss value
+                    for entry in reversed(log_history):
+                        if "loss" in entry:
+                            try:
+                                return float(entry["loss"])
+                            except (ValueError, TypeError):
+                                continue
+    except Exception:
+        pass
+    return None
 
 
 def configure_hf_token_for_session():
@@ -579,9 +600,12 @@ def run():
                 checkpoint_options,
             )
             if checkpoint_action == "Select a specific checkpoint":
-                checkpoint_choices = [
-                    f"Step {Path(cp).name.split('-')[-1]}: {cp}" for cp in all_checkpoints
-                ]
+                checkpoint_choices = []
+                for cp in all_checkpoints:
+                    step = Path(cp).name.split('-')[-1]
+                    loss = get_checkpoint_loss(cp)
+                    loss_str = f"{loss:.4f}" if loss is not None else "N/A"
+                    checkpoint_choices.append(f"Step {step} (loss: {loss_str}): {cp}")
                 selected_index = prompt_select(
                     "Select a checkpoint:",
                     checkpoint_choices,
