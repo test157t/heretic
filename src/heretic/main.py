@@ -19,6 +19,23 @@ from os.path import commonprefix
 from pathlib import Path
 from typing import cast
 
+from . import _warnings as _heretic_warnings  # noqa: F401
+
+# Configure CUDA allocator before importing torch. Setting this after torch is
+# imported is too late for many allocator options.
+if (
+    "PYTORCH_ALLOC_CONF" not in os.environ
+    and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+):
+    if os.name == "nt":
+        # Windows CUDA builds may not support expandable_segments reliably.
+        allocator_conf = "max_split_size_mb:128,garbage_collection_threshold:0.6"
+    else:
+        allocator_conf = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.6"
+
+    os.environ["PYTORCH_ALLOC_CONF"] = allocator_conf
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = allocator_conf
+
 import huggingface_hub
 import optuna
 import torch
@@ -45,6 +62,7 @@ from rich.traceback import install
 
 from .config import QuantizationMethod, Settings
 from .unsloth_stage import (
+    UnslothCheckpointChatModel,
     UnslothStageSettings,
     export_unsloth_checkpoint_snapshot,
     export_unsloth_checkpoint_snapshot_dual,
@@ -66,14 +84,11 @@ from .utils import (
 )
 
 
-def resolve_config_file(primary: str, fallback: str | None = None) -> str:
-    if Path(primary).exists():
-        return primary
+def resolve_config_file(config_file: str) -> str:
+    if Path(config_file).exists():
+        return config_file
 
-    if fallback is not None and Path(fallback).exists():
-        return fallback
-
-    raise FileNotFoundError(primary)
+    raise FileNotFoundError(config_file)
 
 
 def load_toml_file(config_file: str) -> dict:
@@ -174,28 +189,58 @@ def find_all_training_checkpoints(checkpoint_dir: str) -> list[str]:
     return [path for _, path in checkpoints]
 
 
-def get_checkpoint_loss(checkpoint_path: str) -> float | None:
+def _optional_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_checkpoint_metrics(checkpoint_path: str) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        "loss": None,
+        "grad_norm": None,
+        "epoch": None,
+    }
     try:
         trainer_state_file = Path(checkpoint_path) / "trainer_state.json"
         if trainer_state_file.exists():
             with open(trainer_state_file, "r", encoding="utf-8") as f:
                 state = json.load(f)
                 log_history = state.get("log_history", [])
-                if log_history:
-                    # Find the last entry with a loss value
-                    for entry in reversed(log_history):
-                        if "loss" in entry:
-                            try:
-                                return float(entry["loss"])
-                            except (ValueError, TypeError):
-                                continue
+                for entry in reversed(log_history):
+                    if not isinstance(entry, dict):
+                        continue
+                    for key in metrics:
+                        if metrics[key] is None and key in entry:
+                            metrics[key] = _optional_float(entry[key])
+                    if all(value is not None for value in metrics.values()):
+                        break
     except Exception:
         pass
-    return None
+    return metrics
+
+
+def get_checkpoint_loss(checkpoint_path: str) -> float | None:
+    return get_checkpoint_metrics(checkpoint_path)["loss"]
 
 
 def configure_hf_token_for_session():
     existing_token = huggingface_hub.get_token()
+    auth_mode = os.environ.get("HERETIC_HF_AUTH", "").strip().lower()
+
+    if auth_mode in {"existing", "use-existing"}:
+        print()
+        if existing_token:
+            print("* Using existing Hugging Face token")
+        else:
+            print("* Continuing without Hugging Face token")
+        return
+
+    if auth_mode in {"none", "skip"}:
+        print()
+        print("* Continuing without Hugging Face token")
+        return
 
     choices = [
         Choice(
@@ -382,29 +427,13 @@ def chat_with_model(model, settings: Settings):
 
             print("[bold]Assistant:[/] ", end="")
             response = model.stream_chat_response(chat)
-            chat.append(
-                {"role": "assistant", "content": response}
-            )
+            chat.append({"role": "assistant", "content": response})
         except (KeyboardInterrupt, EOFError):
             # Ctrl+C/Ctrl+D
             break
 
 
 def run():
-    # Configure CUDA allocator defaults to reduce fragmentation-induced OOM.
-    if (
-        "PYTORCH_ALLOC_CONF" not in os.environ
-        and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
-    ):
-        if os.name == "nt":
-            # Windows CUDA builds may not support expandable_segments reliably.
-            allocator_conf = "max_split_size_mb:128,garbage_collection_threshold:0.8"
-        else:
-            allocator_conf = "expandable_segments:True,max_split_size_mb:128"
-
-        os.environ["PYTORCH_ALLOC_CONF"] = allocator_conf
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = allocator_conf
-
     # Modified "Pagga" font from https://budavariam.github.io/asciiart-text/
     print(f"[cyan]█░█░█▀▀░█▀▄░█▀▀░▀█▀░█░█▀▀[/]  v{version('heretic-llm')}")
     print("[cyan]█▀█░█▀▀░█▀▄░█▀▀░░█░░█░█░░[/]")
@@ -424,8 +453,9 @@ def run():
     configure_hf_token_for_session()
 
     print(
-        "Select workflow. Training/ablation/slop use config files: "
-        "[bold]config.train.toml[/], [bold]config.ablate.toml[/], [bold]config.slop.toml[/]."
+        "Select workflow. Each workflow uses its own config file: "
+        "[bold]config.train.toml[/], [bold]config.ablate.toml[/], "
+        "[bold]config.slop.toml[/], [bold]config.chat.toml[/]."
     )
     print()
     stage = prompt_select(
@@ -444,6 +474,10 @@ def run():
                 value="slop",
             ),
             Choice(
+                title="Chat with model (config.chat.toml)",
+                value="chat",
+            ),
+            Choice(
                 title="Quantize model to bnb_4bit",
                 value="quantize",
             ),
@@ -459,9 +493,13 @@ def run():
 
     if stage == "quantize":
         print()
-        model_name = prompt_text("Model path or Hugging Face ID to quantize:")
-        if not model_name:
-            return
+        if model_override:
+            model_name = model_override
+            print(f"Model path or Hugging Face ID to quantize: {model_name}")
+        else:
+            model_name = prompt_text("Model path or Hugging Face ID to quantize:")
+            if not model_name:
+                return
 
         output_default = suggest_4bit_export_path(model_name)
         output_model = prompt_text(
@@ -482,7 +520,7 @@ def run():
     if stage == "pre":
         # For Unsloth training, import unsloth before transformers/peft.
         try:
-            import unsloth  # ty:ignore[unresolved-import, unused-ignore]
+            import unsloth  # noqa: F401  # ty:ignore[unresolved-import, unused-ignore]
         except Exception:
             pass
 
@@ -490,11 +528,47 @@ def run():
     import transformers
     from .analyzer import Analyzer
     from .evaluator import Evaluator
-    from .model import AbliterationParameters, Model, get_model_class
+    from .config import DirectionProfile, InterventionMode
+    from .model import AbliterationParameters, Model, OTLayerTransform
+
+    if stage == "chat":
+        chat_model_name = model_override
+        if not chat_model_name:
+            chat_model_name = prompt_text("Model path or Hugging Face ID to chat with:")
+            if not chat_model_name:
+                return
+
+        try:
+            chat_config_file = resolve_config_file("config.chat.toml")
+            chat_settings = load_settings_from_file(
+                chat_config_file,
+                chat_model_name,
+            )
+        except FileNotFoundError as error:
+            missing = str(error) if str(error) else "config.chat.toml"
+            print(f"[red]Could not find [bold]{missing}[/].[/]")
+            return
+        except ValidationError as error:
+            print(
+                f"[red]Configuration contains [bold]{error.error_count()}[/] errors:[/]"
+            )
+            for validation_error in error.errors():
+                print(
+                    f"[bold]{validation_error['loc'][0]}[/]: [yellow]{validation_error['msg']}[/]"
+                )
+            return
+
+        chat_settings.model = chat_model_name
+        chat_model = Model(chat_settings, enable_abliteration=False)
+        print()
+        print_memory_usage()
+        chat_with_model(chat_model, chat_settings)
+        return
 
     pre_stage_settings = None
     config_file = ""
     base_config_file = None
+    settings_model_override = model_override
 
     try:
         if stage == "pre":
@@ -503,29 +577,27 @@ def run():
                 pre_config_file,
                 model_override,
             )
-            config_file = resolve_config_file("config.ablate.toml", "config.toml")
-            # If config.ablate.toml exists, use it as the sole source of truth.
-            # Only fall back to config.toml when config.ablate.toml is missing.
-            if config_file == "config.toml":
-                base_config_file = None
+            if not pre_stage_settings.model:
+                train_model_name = prompt_text(
+                    "Model path or Hugging Face ID to train:"
+                )
+                if not train_model_name:
+                    return
+                pre_stage_settings.model = train_model_name
+            config_file = resolve_config_file("config.chat.toml")
+            settings_model_override = pre_stage_settings.model
 
         elif stage == "ablate":
-            config_file = resolve_config_file("config.ablate.toml", "config.toml")
-            # If config.ablate.toml exists, use it as the sole source of truth.
-            # Only fall back to config.toml when config.ablate.toml is missing.
-            if config_file == "config.toml":
-                base_config_file = None
+            config_file = resolve_config_file("config.ablate.toml")
+            base_config_file = None
 
         else:
             config_file = resolve_config_file("config.slop.toml")
-            if Path("config.ablate.toml").exists():
-                base_config_file = "config.ablate.toml"
-            elif Path("config.toml").exists():
-                base_config_file = "config.toml"
+            base_config_file = None
 
         settings = load_settings_from_file(
             config_file,
-            model_override,
+            settings_model_override,
             base_config_file=base_config_file,
         )
     except FileNotFoundError as error:
@@ -541,13 +613,15 @@ def run():
             print(f"[bold]{error['loc'][0]}[/]: [yellow]{error['msg']}[/]")
 
         print()
-        print("See [bold]config.default.toml[/] for details about configuration parameters.")
+        print(
+            "See [bold]config.default.toml[/] for details about configuration parameters."
+        )
         return
 
     if pre_stage_settings is not None and pre_stage_settings.enabled:
-
-        input_model = pre_stage_settings.model or settings.model
+        input_model = pre_stage_settings.model
         print()
+
         def print_export_verification(report):
             if not isinstance(report, dict):
                 return
@@ -602,17 +676,28 @@ def run():
             if checkpoint_action == "Select a specific checkpoint":
                 checkpoint_choices = []
                 for cp in all_checkpoints:
-                    step = Path(cp).name.split('-')[-1]
-                    loss = get_checkpoint_loss(cp)
+                    step = Path(cp).name.split("-")[-1]
+                    metrics = get_checkpoint_metrics(cp)
+                    loss = metrics["loss"]
+                    grad_norm = metrics["grad_norm"]
+                    epoch = metrics["epoch"]
                     loss_str = f"{loss:.4f}" if loss is not None else "N/A"
-                    checkpoint_choices.append(f"Step {step} (loss: {loss_str}): {cp}")
+                    grad_norm_str = (
+                        f"{grad_norm:.4f}" if grad_norm is not None else "N/A"
+                    )
+                    epoch_str = f"{epoch:.2f}" if epoch is not None else "N/A"
+                    checkpoint_choices.append(
+                        f"Step {step} (loss: {loss_str}, grad_norm: {grad_norm_str}, epoch: {epoch_str}): {cp}"
+                    )
                 selected_index = prompt_select(
                     "Select a checkpoint:",
                     checkpoint_choices,
                 )
                 if selected_index is not None:
-                    selected_checkpoint = all_checkpoints[checkpoint_choices.index(selected_index)]
-                    
+                    selected_checkpoint = all_checkpoints[
+                        checkpoint_choices.index(selected_index)
+                    ]
+
                     # Ask what to do with the selected checkpoint
                     selected_action = prompt_select(
                         f"What do you want to do with checkpoint [bold]{Path(selected_checkpoint).name}[/]?",
@@ -623,7 +708,7 @@ def run():
                             "Go back",
                         ],
                     )
-                    
+
                     if selected_action == "Resume training from this checkpoint":
                         resume_checkpoint = selected_checkpoint
                     elif selected_action == "Chat with this checkpoint":
@@ -636,7 +721,11 @@ def run():
                         print(
                             f"* Using base model [bold]{input_model}[/] with adapter checkpoint [bold]{selected_checkpoint}[/]"
                         )
-                        chat_model = Model(chat_settings)
+                        chat_model = UnslothCheckpointChatModel(
+                            pre_stage_settings,
+                            input_model,
+                            selected_checkpoint,
+                        )
                         print()
                         print_memory_usage()
                         chat_with_model(chat_model, chat_settings)
@@ -650,11 +739,12 @@ def run():
                                 "Merged full model (16-bit)",
                                 "Merged full model (4-bit)",
                                 "Merged full models (16-bit + 4-bit)",
+                                "QAT quantized model (int4, torchao)",
                             ],
                         )
-                        
+
                         suggested_base = suggest_full_precision_base(input_model)
-                        
+
                         if save_mode == "Merged full models (16-bit + 4-bit)":
                             merge_base_model = prompt_text(
                                 "Full-precision base model/path for merged exports (required for pre-quantized bases):",
@@ -665,7 +755,7 @@ def run():
                             if not merge_base_model:
                                 print("[yellow]Combined export cancelled.[/]")
                                 return
-                            
+
                             save_directory_16 = prompt_text(
                                 "Save 16-bit merged model to folder:",
                                 default=f"outputs/{Path(selected_checkpoint).name}-16bit",
@@ -673,8 +763,10 @@ def run():
                             if not save_directory_16:
                                 print("[yellow]Export cancelled.[/]")
                                 return
-                            
-                            save_directory_4 = suggest_4bit_export_path(save_directory_16)
+
+                            save_directory_4 = suggest_4bit_export_path(
+                                save_directory_16
+                            )
                             print(
                                 f"Exporting merged 16-bit and 4-bit models from checkpoint [bold]{selected_checkpoint}[/]..."
                             )
@@ -692,7 +784,29 @@ def run():
                             )
                             print_export_verification(verification)
                             return
-                        
+
+                        if save_mode == "QAT quantized model (int4, torchao)":
+                            save_directory = prompt_text(
+                                "Save QAT quantized model to folder:",
+                                default=f"outputs/{Path(selected_checkpoint).name}-qat-int4",
+                            )
+                            if not save_directory:
+                                print("[yellow]Export cancelled.[/]")
+                                return
+                            print(
+                                f"Exporting QAT model from checkpoint [bold]{selected_checkpoint}[/]..."
+                            )
+                            export_unsloth_checkpoint_snapshot(
+                                base_model=input_model,
+                                adapter_checkpoint=selected_checkpoint,
+                                output_model=save_directory,
+                                save_method="qat_int4",
+                                merge_base_model=None,
+                                qat_scheme="int4",
+                            )
+                            print(f"QAT model saved to [bold]{save_directory}[/].")
+                            return
+
                         save_method = (
                             "merged_16bit"
                             if save_mode == "Merged full model (16-bit)"
@@ -714,7 +828,7 @@ def run():
                             )
                             if merge_base_model == "":
                                 merge_base_model = None
-                        
+
                         save_directory = prompt_text(
                             "Save merged model to folder:",
                             default=f"outputs/{Path(selected_checkpoint).name}-merged",
@@ -722,7 +836,7 @@ def run():
                         if not save_directory:
                             print("[yellow]Export cancelled.[/]")
                             return
-                        
+
                         print(
                             f"Exporting merged model from checkpoint [bold]{selected_checkpoint}[/]..."
                         )
@@ -757,10 +871,26 @@ def run():
                         "Merged full model (16-bit)",
                         "Merged full model (4-bit)",
                         "Merged full models (16-bit + 4-bit)",
+                        "QAT quantized model (int4, torchao)",
                     ],
                 )
 
                 suggested_base = suggest_full_precision_base(input_model)
+
+                if save_mode == "QAT quantized model (int4, torchao)":
+                    print(
+                        f"Exporting QAT model from checkpoint [bold]{runtime_checkpoint}[/]..."
+                    )
+                    export_unsloth_checkpoint_snapshot(
+                        base_model=input_model,
+                        adapter_checkpoint=runtime_checkpoint,
+                        output_model=save_directory,
+                        save_method="qat_int4",
+                        merge_base_model=None,
+                        qat_scheme="int4",
+                    )
+                    print(f"QAT model saved to [bold]{save_directory}[/].")
+                    return
 
                 if save_mode == "Merged full models (16-bit + 4-bit)":
                     merge_base_model = prompt_text(
@@ -847,9 +977,8 @@ def run():
             output_model = pre_result.output_model
             latest_checkpoint = pre_result.latest_checkpoint
 
-            if (
-                latest_checkpoint is not None
-                and Path(output_model).name.startswith("checkpoint-")
+            if latest_checkpoint is not None and Path(output_model).name.startswith(
+                "checkpoint-"
             ):
                 use_checkpoint_runtime = True
                 runtime_checkpoint = latest_checkpoint
@@ -892,7 +1021,14 @@ def run():
                     chat_settings.quantization = prompt_runtime_quantization(
                         chat_settings.quantization
                     )
-                    chat_model = Model(chat_settings)
+                    if latest_checkpoint is not None:
+                        chat_model = UnslothCheckpointChatModel(
+                            pre_stage_settings,
+                            input_model,
+                            latest_checkpoint,
+                        )
+                    else:
+                        chat_model = Model(chat_settings, enable_abliteration=False)
                     print()
                     print_memory_usage()
                     chat_with_model(chat_model, chat_settings)
@@ -946,12 +1082,14 @@ def run():
                 chat_settings.initial_adapter_path = runtime_checkpoint
             else:
                 chat_settings.model = output_model
-            if "float32" in chat_settings.dtypes and chat_settings.dtypes[0] != "float32":
-                chat_settings.dtypes = ["float32"] + [
-                    dtype for dtype in chat_settings.dtypes if dtype != "float32"
-                ]
-
-            chat_model = Model(chat_settings)
+            if use_checkpoint_runtime and runtime_checkpoint is not None:
+                chat_model = UnslothCheckpointChatModel(
+                    pre_stage_settings,
+                    input_model,
+                    runtime_checkpoint,
+                )
+            else:
+                chat_model = Model(chat_settings, enable_abliteration=False)
             print()
             print_memory_usage()
             chat_with_model(chat_model, chat_settings)
@@ -1181,8 +1319,7 @@ def run():
     print("Checking response prefix...")
 
     prefix_detection_enabled = (
-        settings.detect_reasoning_block_prefix
-        or settings.detect_common_response_prefix
+        settings.detect_reasoning_block_prefix or settings.detect_common_response_prefix
     )
 
     if not prefix_detection_enabled:
@@ -1307,6 +1444,7 @@ def run():
     print()
     print("Preparing refusal directions...")
     refusal_directions = None
+    ot_transforms: dict[int, OTLayerTransform] | None = None
     serialized_refusal_directions = study.user_attrs.get("refusal_directions")
     if isinstance(serialized_refusal_directions, str):
         try:
@@ -1315,10 +1453,61 @@ def run():
         except Exception:
             refusal_directions = None
 
-    def get_refusal_directions() -> Tensor:
-        nonlocal refusal_directions
+    def symmetric_matrix_power(matrix: Tensor, power: float) -> Tensor:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+        eigenvalues = torch.clamp(eigenvalues, min=settings.ot_cov_eps)
+        return eigenvectors @ torch.diag(eigenvalues.pow(power)) @ eigenvectors.T
 
-        if refusal_directions is not None:
+    def calculate_ot_transforms(
+        good_residuals: Tensor, bad_residuals: Tensor
+    ) -> dict[int, OTLayerTransform]:
+        transforms = {}
+        layer_count = len(model.get_layers())
+        k = max(1, settings.ot_k)
+
+        for layer_index in range(layer_count):
+            # Residual index 0 is the embeddings; transformer layer n is stored at n + 1.
+            good = good_residuals[:, layer_index + 1]
+            bad = bad_residuals[:, layer_index + 1]
+            combined = torch.cat([good, bad], dim=0)
+            combined = combined - combined.mean(dim=0, keepdim=True)
+            pca_rank = min(k, combined.shape[0], combined.shape[1])
+            _, _, basis = torch.pca_lowrank(combined, q=pca_rank, center=False)
+
+            good_projected = good @ basis
+            bad_projected = bad @ basis
+            good_centered = good_projected - good_projected.mean(dim=0, keepdim=True)
+            bad_centered = bad_projected - bad_projected.mean(dim=0, keepdim=True)
+            good_cov = (
+                good_centered.T @ good_centered / max(1, good_centered.shape[0] - 1)
+            )
+            bad_cov = bad_centered.T @ bad_centered / max(1, bad_centered.shape[0] - 1)
+            eye = torch.eye(pca_rank, device=good_cov.device, dtype=good_cov.dtype)
+            good_cov = good_cov + settings.ot_cov_eps * eye
+            bad_cov = bad_cov + settings.ot_cov_eps * eye
+
+            bad_sqrt = symmetric_matrix_power(bad_cov, 0.5)
+            bad_inv_sqrt = symmetric_matrix_power(bad_cov, -0.5)
+            middle = symmetric_matrix_power(bad_sqrt @ good_cov @ bad_sqrt, 0.5)
+            transport = bad_inv_sqrt @ middle @ bad_inv_sqrt
+
+            transforms[layer_index] = OTLayerTransform(
+                basis=basis.cpu(),
+                transport_delta=(transport - eye).cpu(),
+            )
+
+        return transforms
+
+    def get_refusal_directions() -> Tensor:
+        nonlocal refusal_directions, ot_transforms
+
+        needs_ot = settings.intervention_mode in {
+            InterventionMode.OT_LINEAR,
+            InterventionMode.HYBRID,
+        }
+        if refusal_directions is not None and (
+            not needs_ot or ot_transforms is not None
+        ):
             return refusal_directions
 
         print("* Calculating per-layer refusal directions...")
@@ -1326,6 +1515,10 @@ def run():
         good_residuals = model.get_residuals_batched(good_prompts)
         print("* Obtaining residuals for bad prompts...")
         bad_residuals = model.get_residuals_batched(bad_prompts)
+
+        if needs_ot:
+            print("* Calculating PCA + Gaussian OT transforms...")
+            ot_transforms = calculate_ot_transforms(good_residuals, bad_residuals)
 
         good_means = good_residuals.mean(dim=0)
         bad_means = bad_residuals.mean(dim=0)
@@ -1355,8 +1548,15 @@ def run():
         del good_residuals, bad_residuals, analyzer
         empty_cache()
 
-        study.set_user_attr("refusal_directions", serialize_tensor(refusal_directions))
+        if refusal_directions is not None:
+            study.set_user_attr(
+                "refusal_directions", serialize_tensor(refusal_directions)
+            )
         return refusal_directions
+
+    def get_ot_transforms() -> dict[int, OTLayerTransform] | None:
+        get_refusal_directions()
+        return ot_transforms
 
     trial_index = 0
     start_index = 0
@@ -1392,6 +1592,43 @@ def run():
 
         if direction_scope == "per layer":
             direction_index = None
+
+        selected_layers = None
+        if settings.optimize_layer_selection:
+            count_min = max(1, settings.layer_selection_count_min)
+            count_max = max(
+                count_min, min(settings.layer_selection_count_max, last_layer_index + 1)
+            )
+            if settings.direction_profile == DirectionProfile.WINDOW_HALVES_MEAN_BLEND:
+                count_min = count_max = max(
+                    1, min(settings.window_blend_size, last_layer_index + 1)
+                )
+
+            layer_count = trial.suggest_int(
+                "layer_selection_count", count_min, count_max
+            )
+            depth_min = min(
+                settings.layer_selection_depth_min, settings.layer_selection_depth_max
+            )
+            depth_max = max(
+                settings.layer_selection_depth_min, settings.layer_selection_depth_max
+            )
+            start_min = max(
+                0, min(last_layer_index, round(depth_min * last_layer_index))
+            )
+            start_max = max(
+                0,
+                min(
+                    last_layer_index - layer_count + 1,
+                    round(depth_max * last_layer_index),
+                ),
+            )
+            if start_max < start_min:
+                start_min = start_max
+            layer_start = trial.suggest_int(
+                "layer_selection_start", start_min, start_max
+            )
+            selected_layers = set(range(layer_start, layer_start + layer_count))
 
         parameters = {}
 
@@ -1431,6 +1668,10 @@ def run():
             )
 
         trial.set_user_attr("direction_index", direction_index)
+        trial.set_user_attr(
+            "selected_layers",
+            sorted(selected_layers) if selected_layers is not None else None,
+        )
         trial.set_user_attr("parameters", {k: asdict(v) for k, v in parameters.items()})
 
         print()
@@ -1443,7 +1684,13 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(get_refusal_directions(), direction_index, parameters)
+        model.abliterate(
+            get_refusal_directions(),
+            direction_index,
+            parameters,
+            selected_layers=selected_layers,
+            ot_transforms=get_ot_transforms(),
+        )
         print("* Evaluating...")
         (
             score,
@@ -1548,9 +1795,13 @@ def run():
                 min_divergence = kl_divergence
                 best_trials.append(trial)
 
-        bad_eval_count = cast(int, study.user_attrs.get("bad_evaluation_prompt_count", 0))
+        bad_eval_count = cast(
+            int, study.user_attrs.get("bad_evaluation_prompt_count", 0)
+        )
         if bad_eval_count <= 0:
-            bad_eval_count = len(load_prompts(settings, settings.bad_evaluation_prompts))
+            bad_eval_count = len(
+                load_prompts(settings, settings.bad_evaluation_prompts)
+            )
             study.set_user_attr("bad_evaluation_prompt_count", bad_eval_count)
 
         choices = [
@@ -1622,7 +1873,9 @@ def run():
                 study.set_user_attr("finished", False)
 
                 try:
-                    additional_trials_to_run = settings.n_trials - count_completed_trials()
+                    additional_trials_to_run = (
+                        settings.n_trials - count_completed_trials()
+                    )
                     if additional_trials_to_run > 0:
                         ensure_optimization_baselines()
 
@@ -1649,6 +1902,7 @@ def run():
             print("* Resetting model...")
             model.reset_model()
             print("* Abliterating...")
+            trial_selected_layers = trial.user_attrs.get("selected_layers")
             model.abliterate(
                 get_refusal_directions(),
                 trial.user_attrs["direction_index"],
@@ -1656,6 +1910,10 @@ def run():
                     k: AbliterationParameters(**v)
                     for k, v in trial.user_attrs["parameters"].items()
                 },
+                selected_layers=set(trial_selected_layers)
+                if trial_selected_layers is not None
+                else None,
+                ot_transforms=get_ot_transforms(),
             )
 
             def save_decensored_model(save_mode: str):
@@ -1670,10 +1928,7 @@ def run():
                     return
 
                 merge_base_model = None
-                if (
-                    settings.quantization == QuantizationMethod.BNB_4BIT
-                    and getattr(model, "prequantized_bnb4bit", False)
-                ):
+                if getattr(model, "prequantized_bnb4bit", False):
                     merge_base_model = prompt_text(
                         "Full-precision base model/path for 16-bit merge:",
                         default=suggest_full_precision_base(settings.model),
@@ -1804,13 +2059,12 @@ def run():
                             else:
                                 print("Uploading merged model...")
                                 merge_base_model = None
-                                if (
-                                    settings.quantization == QuantizationMethod.BNB_4BIT
-                                    and getattr(model, "prequantized_bnb4bit", False)
-                                ):
+                                if getattr(model, "prequantized_bnb4bit", False):
                                     merge_base_model = prompt_text(
                                         "Full-precision base model/path for 16-bit merge:",
-                                        default=suggest_full_precision_base(settings.model),
+                                        default=suggest_full_precision_base(
+                                            settings.model
+                                        ),
                                     )
                                     if not merge_base_model:
                                         print("[yellow]Upload cancelled.[/]")
@@ -1875,7 +2129,10 @@ def run():
                             chat_with_model(model, settings)
 
                 except Exception as error:
-                    print(f"[red]Error: {error}[/]")
+                    import traceback
+
+                    print(f"[red]Error: {type(error).__name__}: {error}[/]")
+                    traceback.print_exception(error)
 
 
 def main():

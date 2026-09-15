@@ -1,0 +1,23 @@
+# Chat runtime configuration.
+# This file is consumed only when selecting the standalone chat menu action
+# and for chat-after-training runtime loads.
+
+# Keep chat on explicit low-memory dtypes.
+dtypes = ["float16", "bfloat16", "float32"]
+
+# Do not quantize in chat. Use the Quantize workflow to create a 4-bit snapshot;
+# chat will detect and load that snapshot as 4-bit from its model config.
+quantization = "none"
+
+# Force single-GPU placement. In code this is converted to {"": 0} before loading.
+device_map = "cuda:0"
+
+# Hard CUDA allocator cap as a fraction of total GPU VRAM.
+# This prevents transient load allocations from spilling into Windows shared GPU memory.
+cuda_memory_fraction = 0.90
+
+# Separate chat-time limit. Keep this low enough to avoid wasting VRAM on KV cache.
+chat_max_response_length = 1024
+
+# System prompt to use when prompting the model.
+system_prompt = "You are a helpful assistant."

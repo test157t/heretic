@@ -38,3 +38,5 @@ wheels/
 config.ablate.toml
 config.train.toml
 config.ablate.toml
+config.train.toml
+/Nitral-AI

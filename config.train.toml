@@ -5,26 +5,42 @@
 enabled = true
 
 # Training dataset for Unsloth.
-dataset = "Nitral-AI/Decensor-2048"
+dataset = "Nitral-AI/Caveman-Instruct-2048"
 # Or provide multiple datasets and disable/ignore `dataset` if preferred.
 # datasets = ["Nitral-AI/Instruct_2.6.7_2048", "another/dataset"]
 dataset_split = "train"
 text_column = "text"
 
 # Randomization / sampling controls.
-shuffle_dataset = true
-seed = 42
-sample_size = 1024
+shuffle_dataset = false
+seed = 0
+sample_size = 100000
+# Hold out this percentage of the loaded/sampled dataset for trainer evaluation.
+# Set to 0 to disable evaluation splitting.
+eval_split_percent = 10.0
+# Evaluate every N training optimizer steps.
+eval_steps = 400
+eval_batch_size = 1
+# eval_accumulation_steps = 1
+# Evaluation sample strategy:
+# - "fixed": use the same subset each eval for comparable eval_loss/watchdog signal.
+# - "chunked": rotate through the eval split across scheduled eval runs.
+# - "full": evaluate the entire split each time.
+eval_sample_strategy = "fixed"
+# Optional percent of the held-out eval split to use per eval run.
+# Example: with eval_split_percent = 10, eval_subset_percent = 10 uses 1% of
+# the original sampled dataset for each eval run.
+eval_subset_percent = 10.0
+# Optional fixed cap per eval run. Takes precedence over eval_subset_percent.
+# eval_samples_per_run = 256
 
 # Dataset formatting mode: "text" or "chatml".
 dataset_format = "chatml"
 messages_column = "conversations"
-use_tokenizer_chat_template = false
-use_unsloth_chat_template = true
+use_tokenizer_chat_template = true
+use_unsloth_chat_template = false
 chat_template_name = "chatml"
-chat_template_map_eos_token = false
-# Strip leading <think>/<thought> wrappers right after assistant role boundaries.
-strip_assistant_reasoning_blocks = true
+chat_template_map_eos_token = true
 role_key = "from"
 content_key = "value"
 user_roles = ["human", "user"]
@@ -38,39 +54,90 @@ output_model = "outputs/pre"
 
 # Typical Unsloth knobs (template only).
 load_in_4bit = true
-bf16 = false
+# Force single-GPU placement. Use "auto" only when CPU/disk offload is desired.
+device_map = "cuda:0"
+# max_memory = {"0": "23GB", "cpu": "64GB"}
+bf16 = true
 fp16 = false
+auto_mixed_precision = true
+allow_tf32 = true
 # The dataset targets 2048 context; use extra room for template/control tokens.
 max_seq_length = 2560
-batch_size = 2
+# Separate chat-time limits. Keep these lower than training context to avoid
+# wasting VRAM on interactive checkpoint chat.
+chat_max_seq_length = 1024
+chat_max_response_length = 512
+batch_size = 1
 gradient_accumulation_steps = 4
 learning_rate = 7e-5
 epochs = 1
-max_grad_norm = 2.0
+max_grad_norm = 3.0
 warmup_ratio = 0.07
 lr_scheduler_type = "cosine"
 logging_steps = 10
-save_steps = 10
+# Avoid aligning frequent checkpoint saves with evaluation boundaries.
+save_steps = 400
 
 # LoRA template knobs.
-lora_r = 32
-lora_alpha = 32
+lora_r = 8
+lora_alpha = 16
 lora_dropout = 0.0
 # Supports "none", "all", "lora_only".
 bias = "none"
 # Use true/false, or "unsloth" for lower VRAM use on long context runs.
 use_gradient_checkpointing = "unsloth"
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+# To add 4-bit LoRA on lm_head (applies LoRA adapters, keeps base frozen):
+# target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "lm_head"]
 
 # Mask non-assistant tokens during loss computation.
 train_on_responses_only = true
 
-# Optional explicit delimiters for response-only masking.
-instruction_part = "<|im_start|>user\n"
-response_part = "<|im_start|>assistant\n"
+# Enable Unsloth padding-free batches so packed-sequence metadata caching can
+# reuse per-batch sequence metadata across layers. Keep packing=false because
+# response-only masking is safer without concatenating independent samples.
+padding_free = true
 
-# If response_part accidentally includes reasoning tags, strip them.
-strip_reasoning_tag_in_mask = true
+# Optional: bucket batches by similar sequence lengths to reduce padding and
+# allocator churn/fragmentation in long runs.
+group_by_length = true
+# length_column_name = "__heretic_length"
+# Batch CPU-side formatting/token length passes instead of processing rows one at a time.
+preprocessing_batch_size = 1000
+# Leave unset on Windows unless you need multiprocessing; tokenizer/chat-template functions may not be picklable there.
+# dataset_num_proc = 4
+dataloader_num_workers = 0
+dataloader_pin_memory = true
+
+# Attention backend preference: "auto", "xformers", or "fa2".
+attention_backend = "xformers"
+
+# Optional allocator defrag safety valve for long FA2 runs.
+# Every N training steps, run torch.cuda.empty_cache() when either:
+# - reserved-allocated exceeds threshold, or
+# - reserved crosses target fraction of physical VRAM.
+memory_management_enabled = false
+empty_cache_before_save_eval = true
+memory_defrag_every_n_steps = 10
+memory_defrag_reserved_minus_alloc_gb = 4.0
+memory_defrag_target_fraction = 0.90
+memory_debug_prints = false
+
+# Optional hard allocator cap at CUDA level. This prevents PyTorch from
+# reserving beyond the configured fraction for this process.
+per_process_vram_fraction_cap = 0.90
+
+# QAT (Quantization-Aware Training) via torchao.
+# Requires loading the model in 16-bit; overrides load_in_4bit to false.
+# Supported schemes: "int4", "fp8-int4", "fp8-fp8", "int8-int4"
+qat_enabled = false
+qat_scheme = "int4"
+
+# NVFP4 (E2M1) emulation — constrains weights to NVFP4-representable values
+# after each optimizer step.  Use with load_in_4bit=false; weights stay in
+# bf16 but are projected onto the NVFP4 manifold per group.
+# nvfp4_emulation = true
+# nvfp4_group_size = 128
 
 # Weights & Biases logging.
 wandb_enabled = false

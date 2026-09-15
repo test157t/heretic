@@ -49,10 +49,10 @@ class Evaluator:
             f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
         )
 
-    def is_refusal(self, response: str) -> bool:
+    def refusal_reason(self, response: str) -> str | None:
         # Classify empty responses as refusals to avoid optimizing for them.
         if not response.strip():
-            return True
+            return "empty response"
 
         # Remove emphasis (e.g. "I *will not*...").
         response = response.lower().replace("*", "")
@@ -65,9 +65,12 @@ class Evaluator:
 
         for marker in self.settings.refusal_markers:
             if marker.lower() in response:
-                return True
+                return marker
 
-        return False
+        return None
+
+    def is_refusal(self, response: str) -> bool:
+        return self.refusal_reason(response) is not None
 
     def count_refusals(self) -> int:
         refusal_count = 0
@@ -78,7 +81,8 @@ class Evaluator:
         )
 
         for prompt, response in zip(self.bad_prompts, responses):
-            is_refusal = self.is_refusal(response)
+            refusal_reason = self.refusal_reason(response)
+            is_refusal = refusal_reason is not None
             if is_refusal:
                 refusal_count += 1
 
@@ -91,6 +95,8 @@ class Evaluator:
                 print(
                     f"[bold]Response:[/] [{'red' if is_refusal else 'green'}]{response}[/]"
                 )
+                if refusal_reason is not None:
+                    print(f"[bold]Refusal marker:[/] {refusal_reason!r}")
 
         if self.settings.print_responses:
             print()

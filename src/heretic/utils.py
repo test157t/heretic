@@ -4,6 +4,7 @@
 import gc
 import getpass
 import os
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -31,9 +32,12 @@ from .config import DatasetSpecification, Settings
 print = Console(highlight=False).print
 
 
-def print_memory_usage():
+def print_memory_usage(trim_cache: bool = True):
     def p(label: str, size_in_bytes: int):
         print(f"[grey50]{label}: [bold]{size_in_bytes / (1024**3):.2f} GB[/][/]")
+
+    if trim_cache:
+        empty_cache()
 
     p("Resident system RAM", Process().memory_info().rss)
 
@@ -242,6 +246,8 @@ def empty_cache():
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        with suppress(Exception):
+            torch.cuda.ipc_collect()
     elif is_xpu_available():
         torch.xpu.empty_cache()
     elif is_mlu_available():
@@ -263,6 +269,10 @@ def get_trial_parameters(trial: Trial) -> dict[str, str]:
     params["direction_index"] = (
         "per layer" if (direction_index is None) else f"{direction_index:.2f}"
     )
+
+    selected_layers = trial.user_attrs.get("selected_layers")
+    if selected_layers is not None:
+        params["selected_layers"] = ", ".join(str(layer) for layer in selected_layers)
 
     for component, parameters in trial.user_attrs["parameters"].items():
         for name, value in parameters.items():
@@ -304,9 +314,18 @@ def get_readme_intro(
 
 | Metric | This model | Original model ({model_link}) |
 | :----- | :--------: | :---------------------------: |
-| **Top 5 ordered** | {trial.user_attrs.get("top_5_ordered", float("nan")):.2%} | 100% *(by definition)* |
-| **Top 10 unordered** | {trial.user_attrs.get("top_10_unordered", float("nan")):.2%} | 100% *(by definition)* |
-| **Hellinger distance** | {trial.user_attrs.get("hellinger_distance", float("nan")):.4f} | 0 *(by definition)* |
+| **Top 5 ordered** | {
+        trial.user_attrs.get(
+            "top_5_ordered", float("nan")
+        ):.2%} | 100% *(by definition)* |
+| **Top 10 unordered** | {
+        trial.user_attrs.get(
+            "top_10_unordered", float("nan")
+        ):.2%} | 100% *(by definition)* |
+| **Hellinger distance** | {
+        trial.user_attrs.get(
+            "hellinger_distance", float("nan")
+        ):.4f} | 0 *(by definition)* |
 | **KL divergence** | {trial.user_attrs["kl_divergence"]:.4f} | 0 *(by definition)* |
 | **Refusals** | {trial.user_attrs["refusals"]}/{len(bad_prompts)} | {base_refusals}/{
         len(bad_prompts)

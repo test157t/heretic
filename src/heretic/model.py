@@ -29,7 +29,15 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
-from .config import QuantizationMethod, RowNormalization, Settings
+LOW_MEMORY_DTYPES = {"bfloat16", "float16", "float32"}
+
+from .config import (
+    DirectionProfile,
+    InterventionMode,
+    QuantizationMethod,
+    RowNormalization,
+    Settings,
+)
 from .utils import Prompt, batchify, empty_cache, print
 
 
@@ -52,13 +60,20 @@ class AbliterationParameters:
     min_weight_distance: float
 
 
+@dataclass
+class OTLayerTransform:
+    basis: Tensor
+    transport_delta: Tensor
+
+
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
     peft_config: LoraConfig
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, enable_abliteration: bool = True):
         self.settings = settings
+        self.enable_abliteration = enable_abliteration
         self.response_prefix = ""
         self.needs_reload = False
 
@@ -124,38 +139,55 @@ class Model:
             if settings.max_memory
             else None
         )
+        self.device_map = settings.device_map
+        if torch.cuda.is_available() and settings.cuda_memory_fraction is not None:
+            fraction = max(0.0, min(settings.cuda_memory_fraction, 1.0))
+            if fraction > 0:
+                torch.cuda.set_per_process_memory_fraction(fraction)
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(
+                    f"* CUDA allocator cap: [bold]{fraction * total_gb:.2f} GB[/] ({fraction:.0%} of GPU VRAM)"
+                )
+        if self.device_map in {"cuda", "cuda:0"}:
+            # Avoid Accelerate's auto/offload planner for the common single-GPU
+            # case. For pre-quantized 4-bit checkpoints this prevents large
+            # transient CPU/shared-memory placement spikes during load.
+            self.device_map = {"": 0}
+        print(f"* Device map: [bold]{self.device_map}[/]")
         self.trusted_models = {settings.model: settings.trust_remote_code}
         self.prequantized_bnb4bit = self._is_prequantized_bnb4bit_model()
 
         if self.prequantized_bnb4bit:
-            print("* Detected pre-quantized 4-bit checkpoint; using model-provided quantization config")
+            print(
+                "* Detected pre-quantized 4-bit checkpoint; using model-provided quantization config"
+            )
 
         if self.settings.evaluate_model is not None:
             self.trusted_models[settings.evaluate_model] = settings.trust_remote_code
 
-        dtypes_to_try = settings.dtypes
-        if self.prequantized_bnb4bit:
-            # Dtype probing is not meaningful for already-quantized checkpoints.
-            dtypes_to_try = ["auto"]
+        dtype_attempts = self._get_dtype_attempts()
 
-        for dtype in dtypes_to_try:
-            print(f"* Trying dtype [bold]{dtype}[/]... ", end="")
+        for dtype_label, dtype in dtype_attempts:
+            print(f"* Trying dtype [bold]{dtype_label}[/]... ", end="")
 
             try:
                 quantization_config = self._get_quantization_config(dtype)
 
-                extra_kwargs = {}
+                extra_kwargs = {
+                    "low_cpu_mem_usage": True,
+                    "use_safetensors": True,
+                }
                 # Only include quantization_config if it's not None
                 # (some models like gpt-oss have issues with explicit None).
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                if not self.prequantized_bnb4bit:
+                if dtype is not None and not self.prequantized_bnb4bit:
                     extra_kwargs["dtype"] = dtype
 
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
-                    device_map=settings.device_map,
+                    device_map=self.device_map,
                     max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(settings.model),
                     **extra_kwargs,
@@ -166,25 +198,17 @@ class Model:
                 if self.trusted_models.get(settings.model) is None:
                     self.trusted_models[settings.model] = True
 
-                # A test run can reveal dtype-related problems such as the infamous
-                # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
-                # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(
-                    [
-                        Prompt(
-                            system=settings.system_prompt,
-                            user="What is 1+1?",
-                        )
-                    ],
-                    max_new_tokens=1,
-                )
+                empty_cache()
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
                 print(f"[red]Failed[/] ({error})")
                 continue
 
-            if settings.quantization == QuantizationMethod.BNB_4BIT or self.prequantized_bnb4bit:
+            if (
+                settings.quantization == QuantizationMethod.BNB_4BIT
+                or self.prequantized_bnb4bit
+            ):
                 print("[green]Ok[/] (quantized to 4-bit precision)")
             else:
                 print("[green]Ok[/]")
@@ -194,37 +218,75 @@ class Model:
         if self.model is None:
             raise Exception("Failed to load model with all configured dtypes.")
 
-        self._apply_lora()
+        if self.enable_abliteration:
+            self._apply_lora()
 
         if self.settings.initial_adapter_path:
             print(
                 f"* Loading initial adapter from [bold]{self.settings.initial_adapter_path}[/]... ",
-                end=""
+                end="",
             )
-            assert isinstance(self.model, PeftModel)
-            adapter_name = "initial"
-            self.model.load_adapter(
-                self.settings.initial_adapter_path,
-                adapter_name=adapter_name,
-                is_trainable=False,
-            )
-            self.model.set_adapter(adapter_name)
+            if isinstance(self.model, PeftModel):
+                adapter_name = "initial"
+                self.model.load_adapter(
+                    self.settings.initial_adapter_path,
+                    adapter_name=adapter_name,
+                    is_trainable=False,
+                )
+                self.model.set_adapter(adapter_name)
+            else:
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    self.settings.initial_adapter_path,
+                    is_trainable=False,
+                )
             print("[green]Ok[/]")
+            self._print_loaded_adapter_signal()
 
         # LoRA B matrices are initialized to zero by default in PEFT,
         # so we don't need to do anything manually.
 
         print(f"* Transformer model with [bold]{len(self.get_layers())}[/] layers")
-        print("* Abliterable components:")
-        for component in self.get_abliterable_components():
-            modules = []
-            for layer_index in range(len(self.get_layers())):
-                layer_modules = self.get_layer_modules(layer_index)
-                if component in layer_modules:
-                    modules = layer_modules[component]
-                    break
+        if self.enable_abliteration:
+            print("* Abliterable components:")
+            for component in self.get_abliterable_components():
+                modules = []
+                for layer_index in range(len(self.get_layers())):
+                    layer_modules = self.get_layer_modules(layer_index)
+                    if component in layer_modules:
+                        modules = layer_modules[component]
+                        break
+                print(
+                    f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+                )
+
+    def _print_loaded_adapter_signal(self):
+        if not isinstance(self.model, PeftModel):
+            return
+
+        lora_tensors = 0
+        nonzero_tensors = 0
+        abs_sum = 0.0
+        abs_max = 0.0
+        for name, param in self.model.named_parameters():
+            if "lora_" not in name:
+                continue
+
+            lora_tensors += 1
+            data = param.detach().float()
+            tensor_abs_sum = float(data.abs().sum().item())
+            tensor_abs_max = float(data.abs().max().item()) if data.numel() > 0 else 0.0
+            abs_sum += tensor_abs_sum
+            abs_max = max(abs_max, tensor_abs_max)
+            if tensor_abs_sum > 0.0:
+                nonzero_tensors += 1
+
+        print(
+            f"* Loaded adapter signal: [bold]{nonzero_tensors}[/]/[bold]{lora_tensors}[/] LoRA tensors nonzero (abs_sum={abs_sum:.4e}, max={abs_max:.4e})"
+        )
+        if lora_tensors == 0 or abs_sum <= 0.0:
             print(
-                f"  * [bold]{component}[/]: [bold]{len(modules)}[/] modules per layer"
+                "[yellow]* Warning: loaded adapter appears to have no LoRA signal.[/]"
             )
 
     def _apply_lora(self):
@@ -241,9 +303,14 @@ class Model:
             comp.split(".")[-1] for comp in self.get_abliterable_components()
         ]
 
-        if self.settings.row_normalization != RowNormalization.FULL:
+        if (
+            self.settings.intervention_mode == InterventionMode.DIRECTIONAL
+            and self.settings.row_normalization != RowNormalization.FULL
+        ):
             # Rank 1 is sufficient for directional ablation without renormalization.
             lora_rank = 1
+        elif self.settings.intervention_mode != InterventionMode.DIRECTIONAL:
+            lora_rank = max(1, self.settings.ot_k)
         else:
             # Row magnitude preservation introduces nonlinear effects.
             lora_rank = self.settings.full_normalization_lora_rank
@@ -265,12 +332,56 @@ class Model:
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
 
-    def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
+    def _get_dtype_attempts(self) -> list[tuple[str, torch.dtype | None]]:
+        if self.prequantized_bnb4bit:
+            # Already-quantized checkpoints should be loaded exactly as exported.
+            # Do not pass dtype: the checkpoint's quantization_config owns this.
+            return [("model 4-bit", None)]
+
+        attempts = []
+        declared_dtype = self._get_declared_torch_dtype()
+        if declared_dtype is not None:
+            attempts.append(declared_dtype)
+
+        for dtype in self.settings.dtypes:
+            if dtype == "auto":
+                continue
+            if dtype not in LOW_MEMORY_DTYPES:
+                continue
+            torch_dtype = getattr(torch, dtype)
+            if torch_dtype not in attempts:
+                attempts.append(torch_dtype)
+
+        if not attempts:
+            attempts.append(torch.bfloat16)
+
+        return [(str(dtype).split(".")[-1], dtype) for dtype in attempts]
+
+    def _get_declared_torch_dtype(self) -> torch.dtype | None:
+        config_dict, _ = PretrainedConfig.get_config_dict(self.settings.model)
+        dtype_name = config_dict.get("torch_dtype") or config_dict.get("dtype")
+
+        text_config = config_dict.get("text_config")
+        if dtype_name is None and isinstance(text_config, dict):
+            dtype_name = text_config.get("torch_dtype") or text_config.get("dtype")
+
+        if not isinstance(dtype_name, str):
+            return None
+
+        dtype_name = dtype_name.removeprefix("torch.")
+        if dtype_name not in LOW_MEMORY_DTYPES:
+            return None
+
+        return cast(torch.dtype, getattr(torch, dtype_name))
+
+    def _get_quantization_config(
+        self, dtype: torch.dtype | None
+    ) -> BitsAndBytesConfig | None:
         """
         Creates quantization config based on settings.
 
         Args:
-            dtype: The dtype string (e.g., "auto", "bfloat16")
+            dtype: The compute dtype for runtime 4-bit quantization.
 
         Returns:
             BitsAndBytesConfig or None
@@ -279,15 +390,9 @@ class Model:
             return None
 
         if self.settings.quantization == QuantizationMethod.BNB_4BIT:
-            # BitsAndBytesConfig expects a torch.dtype, not a string.
-            if dtype == "auto":
-                compute_dtype = torch.bfloat16
-            else:
-                compute_dtype = getattr(torch, dtype)
-
             return BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_compute_dtype=dtype or torch.bfloat16,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
@@ -314,10 +419,21 @@ class Model:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
-        # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
+        # Heretic writes the trial/projector LoRA into PEFT's default adapter.
+        # Make full-weight exports deterministic even if another adapter was active.
+        self.model.set_adapter("default")
+
+        # Check if we need special handling for quantized models. Prequantized
+        # BNB snapshots also need this even when Heretic's runtime quantization
+        # setting is "none".
+        if self.settings.quantization == QuantizationMethod.BNB_4BIT or self.prequantized_bnb4bit:
             # Quantized models need special handling - we must reload the base model
             # in full precision to merge the LoRA adapters
+            if self.prequantized_bnb4bit and merge_base_model is None:
+                raise ValueError(
+                    "Cannot create a 16-bit merged model directly from a prequantized 4-bit base. "
+                    "Provide the matching full-precision base model/path for merge."
+                )
 
             # Get the adapter state dict before we do anything
             adapter_state = {}
@@ -385,17 +501,21 @@ class Model:
         self.model = None  # ty:ignore[invalid-assignment]
         empty_cache()
 
-        quantization_config = self._get_quantization_config(str(dtype).split(".")[-1])
+        quantization_config = self._get_quantization_config(dtype)
 
         # Build kwargs, only include quantization_config if it's not None
-        extra_kwargs = {}
+        extra_kwargs = {
+            "low_cpu_mem_usage": True,
+            "use_safetensors": True,
+        }
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
+        extra_kwargs["dtype"] = dtype
+
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
-            dtype=dtype,
-            device_map=self.settings.device_map,
+            device_map=self.device_map,
             max_memory=self.max_memory,
             trust_remote_code=self.trusted_models.get(self.settings.model),
             **extra_kwargs,
@@ -486,6 +606,8 @@ class Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
+        selected_layers: set[int] | None = None,
+        ot_transforms: dict[int, OTLayerTransform] | None = None,
     ):
         if direction_index is None:
             refusal_direction = None
@@ -505,6 +627,9 @@ class Model:
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
+            if selected_layers is not None and layer_index not in selected_layers:
+                continue
+
             if self.settings.protect_first_layer and layer_index == 0:
                 continue
 
@@ -528,7 +653,45 @@ class Model:
                     params.min_weight - params.max_weight
                 )
 
-                if refusal_direction is None:
+                if (
+                    self.settings.direction_profile
+                    == DirectionProfile.WINDOW_HALVES_MEAN_BLEND
+                    and selected_layers
+                    and len(selected_layers) >= 2
+                ):
+                    selected = sorted(selected_layers)
+                    midpoint = max(1, len(selected) // 2)
+                    first_mean = F.normalize(
+                        refusal_directions[
+                            [layer + 1 for layer in selected[:midpoint]]
+                        ].mean(dim=0),
+                        p=2,
+                        dim=0,
+                    )
+                    second_mean = F.normalize(
+                        refusal_directions[
+                            [layer + 1 for layer in selected[midpoint:]]
+                        ].mean(dim=0),
+                        p=2,
+                        dim=0,
+                    )
+                    position = selected.index(layer_index)
+                    t = position / max(1, len(selected) - 1)
+                    dot = torch.clamp(torch.dot(first_mean, second_mean), -1.0, 1.0)
+                    theta = torch.acos(dot)
+                    if float(theta) < 1e-6:
+                        layer_refusal_direction = first_mean
+                    else:
+                        layer_refusal_direction = F.normalize(
+                            (
+                                torch.sin((1 - t) * theta) * first_mean
+                                + torch.sin(t * theta) * second_mean
+                            )
+                            / torch.sin(theta),
+                            p=2,
+                            dim=0,
+                        )
+                elif refusal_direction is None:
                     # The index must be shifted by 1 because the first element
                     # of refusal_directions is the direction for the embeddings.
                     layer_refusal_direction = refusal_directions[layer_index + 1]
@@ -544,14 +707,6 @@ class Model:
                     #        different model configurations, and PEFT employs different
                     #        module types depending on the chosen quantization.
                     module = cast(Linear, module)
-
-                    # LoRA abliteration: delta W = -lambda * v * (v^T W)
-                    # lora_B = -lambda * v
-                    # lora_A = v^T W
-
-                    # Use the FP32 refusal direction directly (no downcast/upcast)
-                    # and move to the correct device.
-                    v = layer_refusal_direction.to(module.weight.device)
 
                     # Get W (dequantize if necessary).
                     #
@@ -578,6 +733,8 @@ class Model:
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
 
+                    W_for_delta = W
+
                     if self.settings.row_normalization != RowNormalization.NONE:
                         # Keep a reference to the original weight matrix so we can subtract it later.
                         W_org = W
@@ -586,41 +743,71 @@ class Model:
                         # Normalize the weight matrix along the rows.
                         W = F.normalize(W, p=2, dim=1)
 
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
+                    lora_delta = None
 
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
+                    if self.settings.intervention_mode in {
+                        InterventionMode.DIRECTIONAL,
+                        InterventionMode.HYBRID,
+                    }:
+                        # LoRA abliteration: delta W = -lambda * v * (v^T W)
+                        v = layer_refusal_direction.to(module.weight.device)
+                        lora_A = (v @ W).view(1, -1)
+                        lora_B = (-weight * v).view(-1, 1)
 
-                    if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
-                        lora_B = W_row_norms * lora_B
-                    elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = self.peft_config.r
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
+                        if self.settings.row_normalization == RowNormalization.PRE:
+                            # Make the LoRA adapter apply to the original weight matrix.
+                            lora_B = W_row_norms * lora_B
+                        elif self.settings.row_normalization == RowNormalization.FULL:
+                            # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
+                            W_adjusted = W + lora_B @ lora_A
+                            # Normalize the adjusted weight matrix along the rows.
+                            W_adjusted = F.normalize(W_adjusted, p=2, dim=1)
+                            # Restore the original row norms of the weight matrix.
+                            W_adjusted = W_adjusted * W_row_norms
+                            # Subtract the original matrix to turn W into a delta.
+                            lora_delta = W_adjusted - W_org
+                        else:
+                            lora_delta = lora_B @ lora_A
+
+                    if self.settings.intervention_mode in {
+                        InterventionMode.OT_LINEAR,
+                        InterventionMode.HYBRID,
+                    }:
+                        assert ot_transforms is not None
+                        ot_transform = ot_transforms[layer_index]
+                        basis = ot_transform.basis.to(module.weight.device)
+                        transport_delta = ot_transform.transport_delta.to(
+                            module.weight.device
+                        )
+                        projected = basis.T @ W_for_delta
+                        ot_delta = basis @ (transport_delta @ projected)
+                        ot_delta = self.settings.ot_linear_scale * weight * ot_delta
+                        if lora_delta is None:
+                            lora_delta = ot_delta
+                        else:
+                            lora_delta = lora_delta + ot_delta
+
+                    assert lora_delta is not None
+
+                    # Use a low-rank SVD to fit the requested adapter rank.
+                    r = self.peft_config.r
+                    q = min(2 * r + 4, min(lora_delta.shape))
+                    U, S, Vh = torch.svd_lowrank(lora_delta, q=q, niter=6)
+                    # Truncate it to the part we want to store in the LoRA adapter.
+                    # Note: svd_lowrank actually returns V, so transpose it to get Vh.
+                    U = U[:, :r]
+                    S = S[:r]
+                    Vh = Vh[:, :r].T
+                    # Transfer it into the LoRA adapter components. Split the singular values
+                    # evenly between the two components to keep their norms balanced and avoid
+                    # potential issues with numerical stability.
+                    sqrt_S = torch.sqrt(S)
+                    lora_B = U @ torch.diag(sqrt_S)
+                    lora_A = torch.diag(sqrt_S) @ Vh
+                    if lora_B.shape[1] < r:
+                        padding = r - lora_B.shape[1]
+                        lora_B = F.pad(lora_B, (0, padding))
+                        lora_A = F.pad(lora_A, (0, 0, 0, padding))
 
                     # Assign to adapters. The adapter name is "default", because that's
                     # what PEFT uses when no name is explicitly specified, as above.
@@ -758,9 +945,11 @@ class Model:
 
     def get_residuals_batched(self, prompts: list[Prompt]) -> Tensor:
         residuals = []
+        batch_size = self.settings.residual_batch_size or self.settings.batch_size
 
-        for batch in batchify(prompts, self.settings.batch_size):
-            residuals.append(self.get_residuals(batch))
+        for batch in batchify(prompts, batch_size):
+            residuals.append(self.get_residuals(batch).cpu())
+            empty_cache()
 
         return torch.cat(residuals, dim=0)
 
@@ -827,7 +1016,7 @@ class Model:
         outputs = self.model.generate(
             **inputs,
             streamer=streamer,
-            max_new_tokens=4096,
+            max_new_tokens=self.settings.chat_max_response_length,
         )  # ty:ignore[call-non-callable]
 
         return self.tokenizer.decode(

@@ -1,40 +1,47 @@
 # Rename this file to config.toml, place it in the working directory
 # that you run Heretic from, and edit the configuration to your liking.
 
+# QAT (Quantization-Aware Training) settings for the Unsloth training stage.
+# See config.train.toml for full details.
+# qat_enabled = false
+# qat_scheme = "int4"
+
 # List of PyTorch dtypes to try when loading model tensors.
-# If loading with a dtype fails, the next dtype in the list will be tried.
-dtypes = [
-    # In practice, "auto" almost always means bfloat16.
-    "auto",
-    # If that doesn't work (e.g. on pre-Ampere hardware), fall back to float16.
-    "float16",
-    # If "auto" resolves to float32, and that fails because it is too large,
-    # and float16 fails due to range issues, try bfloat16.
-    "bfloat16",
-    # If neither of those work, fall back to float32 (which will of course fail
-    # if that was the dtype "auto" resolved to).
-    "float32",
-]
+# Heretic tries the model-declared dtype first; these are only fallbacks.
+dtypes = ["bfloat16", "float16", "float32"]
 
 # Quantization method to use when loading the model. Options:
 # "none" (no quantization),
 # "bnb_4bit" (4-bit quantization using bitsandbytes).
 quantization = "none"
 
-# Device map to pass to Accelerate when loading the model.
-device_map = "auto"
+# Device map to pass when loading the model.
+# "cuda:0" forces single-GPU placement and avoids Accelerate auto-offload spikes.
+device_map = "cuda:0"
 
 # Maximum memory to allocate per device.
 # max_memory = {"0": "20GB", "cpu": "64GB"}
 
+# Hard CUDA allocator cap as a fraction of total GPU VRAM.
+# This prevents transient load allocations from spilling into Windows shared GPU memory.
+cuda_memory_fraction = 0.90
+
 # Number of input sequences to process in parallel (0 = auto).
 batch_size = 0  # auto
+
+# Number of prompts to process in parallel when collecting all-layer residuals.
+# Residual collection is much more memory-intensive than normal generation because
+# it asks the model to return hidden states for every layer and prompt token.
+residual_batch_size = 1
 
 # Maximum batch size to try when automatically determining the optimal batch size.
 max_batch_size = 128
 
 # Maximum number of tokens to generate for each response.
 max_response_length = 100
+
+# Maximum number of tokens to generate for each interactive chat response.
+chat_max_response_length = 1024
 
 # Whether to print prompt/response pairs when counting refusals.
 print_responses = false
@@ -76,6 +83,49 @@ orthogonalize_direction = false
 
 # Whether to skip abliteration on layer 0 as a safeguard.
 protect_first_layer = false
+
+# Whether to optimize a contiguous layer window and only apply abliteration there.
+optimize_layer_selection = false
+
+# Intervention strategy. Options:
+# "directional" (default Heretic behavior),
+# "ot_linear" (PCA+Gaussian-OT linear transport projected into LoRA deltas).
+# "hybrid" (directional + ot_linear combined in one adapter).
+intervention_mode = "directional"
+
+# PCA rank and covariance regularization for intervention_mode="ot_linear".
+ot_k = 2
+ot_cov_eps = 1e-4
+
+# Global multiplier for OT linear deltas in OT-based intervention modes.
+ot_linear_scale = 0.2
+
+# Global multiplier for the compiled LoRA approximation of OT translation (+b).
+ot_compiled_bias_scale = 0.0
+
+# Number of harmful prompts used to estimate component-input means for compiled OT (+b).
+# 0 = use all harmful prompts.
+ot_compiled_bias_prompt_count = 128
+
+# How refusal directions are used inside a selected layer window for intervention_mode="directional". Options:
+# "standard" (existing directional ablation),
+# "window_halves_mean_blend" (SLERP gradient between means of first and second window halves).
+direction_profile = "standard"
+
+# Window size used only when direction_profile="window_halves_mean_blend".
+# Ignored for direction_profile="standard".
+# Currently intended for a 4-layer contiguous window.
+window_blend_size = 4
+
+# Normalized depth range (0-1) of selectable layers when optimize_layer_selection is enabled.
+# Defaults are chosen to target the middle-depth region highlighted by recent OT work.
+layer_selection_depth_min = 0.4
+layer_selection_depth_max = 0.6
+
+# Minimum/maximum number of contiguous selected layers.
+# Values should match window_blend_size for window_halves_mean_blend.
+layer_selection_count_min = 1
+layer_selection_count_max = 2
 
 # How to apply row normalization of the weights. Options:
 # "none" (no normalization),

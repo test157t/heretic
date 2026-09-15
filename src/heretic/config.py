@@ -4,7 +4,7 @@
 from enum import Enum
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -24,6 +24,17 @@ class RowNormalization(str, Enum):
     PRE = "pre"
     # POST = "post"  # Theoretically possible, but provides no advantage.
     FULL = "full"
+
+
+class InterventionMode(str, Enum):
+    DIRECTIONAL = "directional"
+    OT_LINEAR = "ot_linear"
+    HYBRID = "hybrid"
+
+
+class DirectionProfile(str, Enum):
+    STANDARD = "standard"
+    WINDOW_HALVES_MEAN_BLEND = "window_halves_mean_blend"
 
 
 class DatasetSpecification(BaseModel):
@@ -62,6 +73,8 @@ class DatasetSpecification(BaseModel):
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(extra="ignore")
+
     model: str = Field(description="Hugging Face model ID, or path to model on disk.")
 
     evaluate_model: str | None = Field(
@@ -82,15 +95,9 @@ class Settings(BaseSettings):
 
     dtypes: list[str] = Field(
         default=[
-            # In practice, "auto" almost always means bfloat16.
-            "auto",
-            # If that doesn't work (e.g. on pre-Ampere hardware), fall back to float16.
-            "float16",
-            # If "auto" resolves to float32, and that fails because it is too large,
-            # and float16 fails due to range issues, try bfloat16.
+            # Prefer the model-declared dtype first; these are only fallbacks.
             "bfloat16",
-            # If neither of those work, fall back to float32 (which will of course fail
-            # if that was the dtype "auto" resolved to).
+            "float16",
             "float32",
         ],
         description=(
@@ -109,13 +116,21 @@ class Settings(BaseSettings):
     )
 
     device_map: str | Dict[str, int | str] = Field(
-        default="auto",
+        default="cuda:0",
         description="Device map to pass to Accelerate when loading the model.",
     )
 
     max_memory: Dict[str, str] | None = Field(
         default=None,
         description='Maximum memory to allocate per device (e.g., {"0": "20GB", "cpu": "64GB"}).',
+    )
+
+    cuda_memory_fraction: float | None = Field(
+        default=0.90,
+        description=(
+            "Optional hard CUDA allocator cap as a fraction of total GPU VRAM. "
+            "This prevents Windows from spilling transient allocations into shared GPU memory."
+        ),
     )
 
     trust_remote_code: bool | None = Field(
@@ -128,6 +143,14 @@ class Settings(BaseSettings):
         description="Number of input sequences to process in parallel (0 = auto).",
     )
 
+    residual_batch_size: int | None = Field(
+        default=1,
+        description=(
+            "Number of prompts to process in parallel when collecting all-layer residuals. "
+            "This is separate from batch_size because hidden-state collection is much more memory-intensive than normal generation."
+        ),
+    )
+
     max_batch_size: int = Field(
         default=128,
         description="Maximum batch size to try when automatically determining the optimal batch size.",
@@ -136,6 +159,11 @@ class Settings(BaseSettings):
     max_response_length: int = Field(
         default=100,
         description="Maximum number of tokens to generate for each response.",
+    )
+
+    chat_max_response_length: int = Field(
+        default=1024,
+        description="Maximum number of tokens to generate for each interactive chat response.",
     )
 
     print_responses: bool = Field(
@@ -213,6 +241,82 @@ class Settings(BaseSettings):
         description=(
             "Whether to skip abliteration on layer 0 as a safeguard against early-layer damage."
         ),
+    )
+
+    optimize_layer_selection: bool = Field(
+        default=False,
+        description="Whether to optimize a contiguous layer window and only apply intervention there.",
+    )
+
+    intervention_mode: InterventionMode = Field(
+        default=InterventionMode.DIRECTIONAL,
+        description=(
+            "Intervention strategy. Options: "
+            '"directional" (default Heretic behavior), '
+            '"ot_linear" (PCA+Gaussian-OT linear transport projected into LoRA deltas), '
+            '"hybrid" (directional + ot_linear combined in one adapter).'
+        ),
+    )
+
+    ot_k: int = Field(
+        default=2,
+        description="PCA rank used by the Gaussian optimal transport projector.",
+    )
+
+    ot_cov_eps: float = Field(
+        default=1e-4,
+        description="Diagonal covariance regularization used by Gaussian optimal transport.",
+    )
+
+    ot_linear_scale: float = Field(
+        default=0.2,
+        description="Global multiplier for OT linear deltas in OT-based intervention modes.",
+    )
+
+    ot_compiled_bias_scale: float = Field(
+        default=0.0,
+        description=(
+            "Reserved multiplier for compiling the OT translation term into LoRA. "
+            "Only the linear OT map is currently projected into LoRA."
+        ),
+    )
+
+    ot_compiled_bias_prompt_count: int = Field(
+        default=128,
+        description="Reserved prompt count for estimating a compiled OT translation term.",
+    )
+
+    direction_profile: DirectionProfile = Field(
+        default=DirectionProfile.STANDARD,
+        description=(
+            "How refusal directions are used inside a selected layer window for directional intervention. "
+            'Options: "standard", "window_halves_mean_blend".'
+        ),
+    )
+
+    window_blend_size: int = Field(
+        default=4,
+        description="Window size used when direction_profile is window_halves_mean_blend.",
+    )
+
+    layer_selection_depth_min: float = Field(
+        default=0.4,
+        description="Minimum normalized depth of selectable layers when optimize_layer_selection is enabled.",
+    )
+
+    layer_selection_depth_max: float = Field(
+        default=0.6,
+        description="Maximum normalized depth of selectable layers when optimize_layer_selection is enabled.",
+    )
+
+    layer_selection_count_min: int = Field(
+        default=1,
+        description="Minimum contiguous selected layer count.",
+    )
+
+    layer_selection_count_max: int = Field(
+        default=2,
+        description="Maximum contiguous selected layer count.",
     )
 
     row_normalization: RowNormalization = Field(
